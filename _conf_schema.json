@@ -1,0 +1,95 @@
+{
+  "oauth_settings": {
+    "type": "object",
+    "description": "OAuth 登录设置",
+    "hint": "控制 Kimi Code 设备码登录流程",
+    "items": {
+      "oauth_host": {
+        "type": "string",
+        "description": "OAuth 服务地址",
+        "hint": "通常无需修改",
+        "default": "https://auth.kimi.com"
+      },
+      "login_timeout_seconds": {
+        "type": "int",
+        "description": "登录等待超时（秒）",
+        "hint": "设备码授权总等待时间，默认 15 分钟",
+        "default": 900,
+        "slider": {
+          "min": 60,
+          "max": 1800,
+          "step": 30
+        }
+      }
+    }
+  },
+  "connection_settings": {
+    "type": "object",
+    "description": "连接设置",
+    "hint": "控制 OAuth 与 datasource API 请求",
+    "items": {
+      "request_timeout_seconds": {
+        "type": "int",
+        "description": "请求超时（秒）",
+        "hint": "单次 HTTP 请求最大等待时间",
+        "default": 30,
+        "slider": {
+          "min": 5,
+          "max": 120,
+          "step": 5
+        }
+      },
+      "proxy": {
+        "type": "string",
+        "description": "HTTP 代理地址",
+        "hint": "例如: http://127.0.0.1:7890，留空则不使用代理",
+        "default": ""
+      }
+    }
+  },
+  "datasource_settings": {
+    "type": "object",
+    "description": "Datasource 设置",
+    "hint": "控制 Kimi datasource API 与响应处理",
+    "items": {
+      "api_url": {
+        "type": "string",
+        "description": "Datasource API 地址",
+        "hint": "默认使用 Kimi Code 官方 datasource endpoint",
+        "default": "https://api.kimi.com/coding/v1/tools"
+      },
+      "response_parse_mode": {
+        "type": "string",
+        "description": "响应解析模式",
+        "hint": "official 对齐当前 Kimi Code MCP；legacy_zip 优先 assistant 文本",
+        "default": "official",
+        "options": [
+          "official",
+          "legacy_zip"
+        ]
+      },
+      "save_response_files": {
+        "type": "bool",
+        "description": "保存响应文件",
+        "hint": "将上游 response.files 安全写入插件数据目录",
+        "default": true
+      }
+    }
+  },
+  "account_settings": {
+    "type": "object",
+    "description": "账号设置",
+    "hint": "显示已登录的 Kimi OAuth 账号 ID；从列表删除 ID 并触发同步后会删除对应账号凭证",
+    "items": {
+      "account_ids": {
+        "type": "list",
+        "description": "已登录账号 ID",
+        "hint": "登录成功后自动追加。删除某个 ID 并保存配置后，插件会在自动删除对应 OAuth 账号。",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      }
+    }
+  }
+}

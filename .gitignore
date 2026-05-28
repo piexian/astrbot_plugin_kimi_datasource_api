@@ -191,6 +191,12 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Local verification tests
+tests/
+
+# Local AstrBot plugin data fallback
+data/
+
 # PyPI configuration file
 .pypirc
 

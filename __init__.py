@@ -1,0 +1,1 @@
+"""AstrBot Kimi datasource plugin."""
