@@ -25,6 +25,8 @@
 - LLM Tool (`query_stock`) - 查询最多 3 个股票代码的实时价格、技术指标、开盘/收盘摘要
 - LLM Tool (`get_data_source_desc`) - 获取 Kimi datasource 的当前 API 文档
 - LLM Tool (`call_data_source_tool`) - 按 datasource 文档调用具体 API
+- LLM Tool (`moonshot_search`) - 通过 Kimi Code Moonshot search 使用 Kimi OAuth 执行网页检索
+- LLM Tool (`moonshot_fetch`) - 通过 Kimi Code Moonshot fetch 抓取 URL 正文，远端失败时本地兜底
 - 自动 refresh - tool 调用前自动检查并刷新即将过期的 access token
 - 响应文件落盘 - 将上游 `response.files` 安全保存到插件数据目录
 
@@ -133,15 +135,19 @@ cancel
 
 ### LLM Tool
 
-插件会注册三个官方同名工具；是否允许模型调用工具由 AstrBot 内部工具控制负责：
+插件会注册三个 datasource 工具和两个 Kimi 网页工具；是否允许模型调用工具由 AstrBot 内部工具控制负责。
+Moonshot 网页工具复用同一套 OAuth 账号池和设备头。
 
 | 工具名 | 用途 |
 |--------|------|
 | `query_stock` | 查询实时股票数据，最多 3 个 ticker |
 | `get_data_source_desc` | 调用具体 datasource API 前获取当前 API 文档 |
 | `call_data_source_tool` | 按文档调用具体 datasource API |
+| `moonshot_search` | 调用 Kimi Code Moonshot search，支持结果数量和页面内容抓取开关 |
+| `moonshot_fetch` | 调用 Kimi Code Moonshot fetch 抓取 URL 正文，远端失败时回落到本地抓取 |
 
 典型流程是先调用 `get_data_source_desc` 获取数据源文档，再调用 `call_data_source_tool`。
+网页检索和 URL 正文展开直接调用 `moonshot_search` / `moonshot_fetch`。
 
 
 ## 项目结构
@@ -151,6 +157,7 @@ astrbot_plugin_kimi_datasource_api/
 ├── main.py              # 插件入口
 ├── oauth.py             # 登录流程
 ├── datasource.py        # datasource API
+├── moonshot.py          # Kimi search / fetch
 ├── storage.py           # 插件 KV 凭证结构、设备 ID 与脱敏
 ├── identity.py          # 设备身份头
 ├── schemas.py           # 工具 schema
@@ -161,6 +168,7 @@ astrbot_plugin_kimi_datasource_api/
 │       └── SKILL.md     # 指导模型优先使用 datasource
 ├── metadata.yaml        # 插件元数据
 ├── _conf_schema.json    # 配置项
+├── CHANGELOG.md         # 版本日志
 └── README.md
 ```
 

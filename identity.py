@@ -65,3 +65,28 @@ def datasource_headers(token: str, device_id: str, version: str = KIMI_DATASOURC
         "X-Msh-Device-Id": ascii_header(env.get("KIMI_MSH_DEVICE_ID", device_id)),
         "User-Agent": f"kimi-datasource/{version}",
     }
+
+
+def moonshot_headers(
+    token: str,
+    device_id: str,
+    version: str = KIMI_DATASOURCE_VERSION,
+    *,
+    accept: str = "",
+) -> dict[str, str]:
+    env = os.environ
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Msh-Tool-Call-Id": str(uuid4()),
+        "X-Msh-Platform": ascii_header(env.get("KIMI_MSH_PLATFORM", KIMI_OAUTH_PLATFORM)),
+        "X-Msh-Version": ascii_header(env.get("KIMI_MSH_VERSION", version)),
+        "X-Msh-Device-Name": device_name(),
+        "X-Msh-Device-Model": device_model(),
+        "X-Msh-Os-Version": device_os_version(),
+        "X-Msh-Device-Id": ascii_header(env.get("KIMI_MSH_DEVICE_ID", device_id)),
+        "User-Agent": f"kimi-code/{version}",
+    }
+    if accept:
+        headers["Accept"] = accept
+    return headers

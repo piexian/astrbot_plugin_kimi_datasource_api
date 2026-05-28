@@ -56,3 +56,33 @@ CALL_DATA_SOURCE_TOOL_SCHEMA = {
     },
     "required": ["data_source_name", "api_name", "params"],
 }
+
+MOONSHOT_SEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "Search query.",
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Maximum number of search results to return, from 1 to 10. Defaults to 5.",
+        },
+        "include_content": {
+            "type": "boolean",
+            "description": "Ask the upstream service to crawl result pages and include page content.",
+        },
+    },
+    "required": ["query"],
+}
+
+MOONSHOT_FETCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {
+            "type": "string",
+            "description": "HTTP or HTTPS URL to fetch.",
+        },
+    },
+    "required": ["url"],
+}

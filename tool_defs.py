@@ -19,4 +19,8 @@ class KimiFunctionTool(FunctionTool):
             return await self.plugin._tool_get_data_source_desc(**kwargs)
         if self.name == "call_data_source_tool":
             return await self.plugin._tool_call_data_source_tool(**kwargs)
+        if self.name == "moonshot_search":
+            return await self.plugin._tool_moonshot_search(**kwargs)
+        if self.name == "moonshot_fetch":
+            return await self.plugin._tool_moonshot_fetch(**kwargs)
         raise RuntimeError(f"Unknown tool: {self.name}")

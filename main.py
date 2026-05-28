@@ -25,8 +25,15 @@ from .constants import (
 )
 from .datasource import KimiDatasourceClient
 from .models import KimiPluginError, OAuthUnauthorizedError, token_from_credentials
+from .moonshot import KimiMoonshotClient
 from .oauth import KimiOAuthClient
-from .schemas import CALL_DATA_SOURCE_TOOL_SCHEMA, GET_DATA_SOURCE_DESC_SCHEMA, QUERY_STOCK_SCHEMA
+from .schemas import (
+    CALL_DATA_SOURCE_TOOL_SCHEMA,
+    GET_DATA_SOURCE_DESC_SCHEMA,
+    MOONSHOT_FETCH_SCHEMA,
+    MOONSHOT_SEARCH_SCHEMA,
+    QUERY_STOCK_SCHEMA,
+)
 from .sessions import PendingLogin, PendingLoginRegistry
 from .storage import KimiCredentialStore, mask_token, normalize_account_id, normalize_account_id_list
 from .tool_defs import KimiFunctionTool
@@ -123,6 +130,7 @@ class KimiDatasourcePlugin(Star):
         self.pending_logins = PendingLoginRegistry()
         self.oauth = self._build_oauth_client()
         self.datasource = self._build_datasource_client()
+        self.moonshot = self._build_moonshot_client()
 
     async def initialize(self) -> None:
         await self._sync_config_accounts()
@@ -143,6 +151,18 @@ class KimiDatasourcePlugin(Star):
                 name="call_data_source_tool",
                 description="Call one API from a Kimi data source after reading get_data_source_desc.",
                 parameters=CALL_DATA_SOURCE_TOOL_SCHEMA,
+                plugin=self,
+            ),
+            KimiFunctionTool(
+                name="moonshot_search",
+                description="Search the web through Kimi Code Moonshot search using the configured Kimi OAuth account.",
+                parameters=MOONSHOT_SEARCH_SCHEMA,
+                plugin=self,
+            ),
+            KimiFunctionTool(
+                name="moonshot_fetch",
+                description="Fetch and extract one HTTP or HTTPS URL through Kimi Code Moonshot fetch, with local fallback.",
+                parameters=MOONSHOT_FETCH_SCHEMA,
                 plugin=self,
             ),
         )
@@ -177,6 +197,14 @@ class KimiDatasourcePlugin(Star):
             response_parse_mode=str(self._cfg("response_parse_mode", "official") or "official"),
             save_response_files=bool(self._cfg("save_response_files", True)),
             files_dir=self._plugin_data_dir() / "files",
+        )
+
+    def _build_moonshot_client(self) -> KimiMoonshotClient:
+        return KimiMoonshotClient(
+            self.store,
+            self.oauth,
+            timeout_seconds=int(self._cfg("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)),
+            proxy=str(self._cfg("proxy", "") or ""),
         )
 
     def _plugin_data_dir(self) -> Path:
@@ -359,17 +387,34 @@ class KimiDatasourcePlugin(Star):
             )
         )
 
+    async def _tool_moonshot_search(
+        self,
+        query: str,
+        limit: int = 5,
+        include_content: bool = False,
+    ) -> str:
+        return await self._run_tool(
+            lambda: self.moonshot.search(
+                query=query,
+                limit=limit,
+                include_content=include_content,
+            )
+        )
+
+    async def _tool_moonshot_fetch(self, url: str) -> str:
+        return await self._run_tool(lambda: self.moonshot.fetch_url(url=url))
+
     async def _run_tool(self, factory) -> str:
         try:
             await self._sync_config_accounts()
             return await factory()
         except OAuthUnauthorizedError as exc:
-            return f"Kimi datasource 需要重新登录: {exc} 请让管理员执行 kimi login。"
+            return f"Kimi OAuth 需要重新登录: {exc} 请让管理员执行 kimi login。"
         except KimiPluginError as exc:
-            return f"Kimi datasource 调用失败: {exc}"
+            return f"Kimi 工具调用失败: {exc}"
         except Exception as exc:
             logger.error(f"[{PLUGIN_NAME}] unexpected tool error: {exc}", exc_info=True)
-            return f"Kimi datasource 调用失败: {exc}"
+            return f"Kimi 工具调用失败: {exc}"
 
     async def _import_local_kimi_code(self, session_id: str, requested_id: str = "") -> str:
         credentials_path = None
