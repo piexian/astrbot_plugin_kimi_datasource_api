@@ -51,12 +51,12 @@ def oauth_device_headers(device_id: str, version: str) -> dict[str, str]:
     }
 
 
-def datasource_headers(token: str, device_id: str, version: str = KIMI_DATASOURCE_VERSION) -> dict[str, str]:
+def datasource_headers(token: str, device_id: str, version: str = KIMI_DATASOURCE_VERSION, *, tool_call_id: str = "") -> dict[str, str]:
     env = os.environ
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "X-Msh-Tool-Call-Id": str(uuid4()),
+        "X-Msh-Tool-Call-Id": tool_call_id or str(uuid4()),
         "X-Msh-Platform": ascii_header(env.get("KIMI_MSH_PLATFORM", KIMI_DATASOURCE_PLATFORM)),
         "X-Msh-Version": ascii_header(env.get("KIMI_MSH_VERSION", version)),
         "X-Msh-Device-Name": device_name(),

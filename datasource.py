@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import aiohttp
 
@@ -87,10 +88,14 @@ class KimiDatasourceClient:
             raise OAuthUnauthorizedError("No Kimi OAuth accounts are available. Ask an administrator to run kimi login.")
 
         start_id = await self.store.next_account_id(account_ids)
+        tool_call_id = str(uuid4())
+        request_id = ""
         errors: list[str] = []
         for account_id in account_rotation(account_ids, start_id):
             try:
-                response = await self._post_json(method, params, account_id=account_id, force_refresh=False)
+                response, request_id = await self._post_json(
+                    method, params, account_id=account_id, force_refresh=False, tool_call_id=tool_call_id
+                )
                 break
             except OAuthUnauthorizedError as exc:
                 errors.append(f"{account_id}: {exc}")
@@ -99,7 +104,9 @@ class KimiDatasourceClient:
                 if exc.status not in {401, 403}:
                     raise
                 try:
-                    response = await self._post_json(method, params, account_id=account_id, force_refresh=True)
+                    response, request_id = await self._post_json(
+                        method, params, account_id=account_id, force_refresh=True, tool_call_id=tool_call_id
+                    )
                     break
                 except DatasourceHTTPError as retry_exc:
                     if retry_exc.status in {401, 403}:
@@ -113,12 +120,17 @@ class KimiDatasourceClient:
         else:
             message = "; ".join(errors) if errors else "all accounts failed"
             raise OAuthUnauthorizedError(f"Kimi datasource authorization failed for every configured account: {message}")
-
-        text = extract_text(response, mode=self.response_parse_mode)
+        text = append_trace(
+            extract_text(response, mode=self.response_parse_mode),
+            request_id=request_id,
+            tool_call_id=tool_call_id,
+        )
         saved_files = await self._save_response_files(response)
         return DatasourceResult(text=text, saved_files=saved_files)
 
-    async def _post_json(self, method: str, params: dict[str, Any], *, account_id: str, force_refresh: bool) -> Any:
+    async def _post_json(
+        self, method: str, params: dict[str, Any], *, account_id: str, force_refresh: bool, tool_call_id: str = ""
+    ) -> tuple[Any, str]:
         token = await self.oauth.ensure_fresh(account_id, force=force_refresh)
         device_id = await self.store.get_device_id()
         timeout = aiohttp.ClientTimeout(total=max(1, self.timeout_seconds))
@@ -127,16 +139,16 @@ class KimiDatasourceClient:
                 async with session.post(
                     self.api_url,
                     json={"method": method, "params": params},
-                    headers=datasource_headers(token, device_id, KIMI_DATASOURCE_VERSION),
+                    headers=datasource_headers(token, device_id, KIMI_DATASOURCE_VERSION, tool_call_id=tool_call_id),
                     proxy=self.proxy,
                 ) as response:
                     body = await response.text()
                     if not response.ok:
                         raise DatasourceHTTPError(response.status, body)
                     try:
-                        return json.loads(body)
+                        return json.loads(body), extract_request_id(response.headers)
                     except json.JSONDecodeError:
-                        return body
+                        return body, extract_request_id(response.headers)
             except asyncio.TimeoutError:
                 raise DatasourceError(f"Request timed out after {self.timeout_seconds} seconds.") from None
             except aiohttp.ClientError as exc:
@@ -220,7 +232,8 @@ def extract_text(response: Any, *, mode: str = "official") -> str:
     if mode == "legacy_zip":
         text = extract_role_text(result, "assistant") or extract_role_text(result, "user")
     else:
-        text = extract_role_text(result, "user")
+        # official: user 通道是干净的 data_preview，assistant 通道作为兜底
+        text = extract_role_text(result, "user") or extract_role_text(result, "assistant")
     if text:
         return text
     return f"Tool API succeeded but did not return user text. Raw response: {json.dumps(response, ensure_ascii=False)}"
@@ -242,6 +255,32 @@ def extract_role_text(value: Any, role: str) -> str | None:
         if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str) and item["text"]
     )
     return text or None
+
+
+REQUEST_ID_HEADER_KEYS = ("x-request-id", "x-trace-id", "x-msh-request-id", "x-msh-trace-id", "request-id")
+
+
+def extract_request_id(headers: Any) -> str:
+    # 网关可能回传 request id；aiohttp 头大小写不敏感，普通 dict 需要兜底
+    for key in REQUEST_ID_HEADER_KEYS:
+        value = headers.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    items = getattr(headers, "items", None)
+    if callable(items):
+        for name, value in items():
+            if isinstance(name, str) and name.lower() in REQUEST_ID_HEADER_KEYS and isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def append_trace(text: str, *, request_id: str, tool_call_id: str) -> str:
+    # 对齐官方 3.2.0：结果末尾追加 trace 行，便于关联后端日志
+    if not tool_call_id:
+        return text
+    parts = [f"request-id: {request_id}"] if request_id else []
+    parts.append(f"tool-call-id: {tool_call_id}")
+    return f"{text}\n\n[kimi-datasource] {' · '.join(parts)}"
 
 
 def required_string(value: str, field: str) -> str:

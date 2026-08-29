@@ -32,11 +32,21 @@ GET_DATA_SOURCE_DESC_SCHEMA = {
         "name": {
             "type": "string",
             "enum": KNOWN_DATA_SOURCES,
-            "description": "Data source name.",
+            "description": (
+                "Data source name. Capabilities: stock_finance_data / yahoo_finance = general quotes and financials "
+                "(yahoo_finance FX history is limited to about 2 years); world_bank_open_data = historical macro; "
+                "imf = FX rates, CPI, GDP forecasts, balance of payments; tianyancha = CN company registry; "
+                "arxiv / scholar = papers; yuandian_law = CN laws and cases; "
+                "wind = A-share intraday minute series, funds, bonds (map PE/PB/ROE-style field names via wind_search_fields first); "
+                "gildata = natural-language stock/fund screening; "
+                "sec_edgar = US filings (10-K/10-Q, S-1, Form 4, 13F, 8-K); "
+                "sp_data = S&P fundamentals (consensus estimates, valuation ratios, transcripts)."
+            ),
         },
     },
     "required": ["name"],
 }
+
 
 CALL_DATA_SOURCE_TOOL_SCHEMA = {
     "type": "object",
@@ -62,15 +72,14 @@ MOONSHOT_SEARCH_SCHEMA = {
     "properties": {
         "query": {
             "type": "string",
-            "description": "Search query.",
-        },
-        "limit": {
-            "type": "integer",
-            "description": "Maximum number of search results to return, from 1 to 10. Defaults to 5.",
+            "description": "The query text to search for.",
         },
         "include_content": {
             "type": "boolean",
-            "description": "Ask the upstream service to crawl result pages and include page content.",
+            "description": (
+                "Include the full page content of every result in the output. Defaults to false; "
+                "prefer reading a single relevant page with moonshot_fetch instead."
+            ),
         },
     },
     "required": ["query"],

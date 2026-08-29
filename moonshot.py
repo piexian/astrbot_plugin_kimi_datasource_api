@@ -27,6 +27,15 @@ AUTH_STATUS_CODES = {401, 403}
 MAX_LOCAL_FETCH_BYTES = 10 * 1024 * 1024
 MAX_LOCAL_REDIRECTS = 5
 
+# 官方 fetch 输出前缀：说明内容来源并提示以 markdown 链接引用
+FETCH_REMOTE_NOTE = (
+    "The returned content is the main text extracted from the page. "
+    "If you use it in your answer, cite this page as a markdown link, e.g. [title](url).\n\n"
+)
+FETCH_LOCAL_NOTE = (
+    "The returned content was extracted by the local fallback because the remote fetch failed. "
+    "If you use it in your answer, cite this page as a markdown link, e.g. [title](url).\n\n"
+)
 
 class KimiMoonshotClient:
     def __init__(
@@ -46,20 +55,15 @@ class KimiMoonshotClient:
         self.timeout_seconds = timeout_seconds
         self.proxy = proxy.strip() or None
 
-    async def search(self, *, query: str, limit: int = 5, include_content: bool = False) -> str:
+    async def search(self, *, query: str, include_content: bool = False) -> str:
         query = required_string(query, "query")
-        limit = normalize_limit(limit)
+        # 官方仅发送 text_query；服务端实测忽略 limit / timeout 等字段
         response = await self._post_with_rotation(
             self.search_url,
-            {
-                "text_query": query,
-                "limit": limit,
-                "enable_page_crawling": bool(include_content),
-                "timeout_seconds": max(1, self.timeout_seconds),
-            },
+            {"text_query": query},
             expect_json=True,
         )
-        return format_search_results(response)
+        return format_search_results(response, include_content=include_content)
 
     async def fetch_url(self, *, url: str) -> str:
         url = validate_http_url(url)
@@ -78,8 +82,10 @@ class KimiMoonshotClient:
             return await self._local_fetch_after_remote_error(url, exc)
 
         text = str(response).strip()
-        return text or "Moonshot fetch returned an empty response."
-
+        if not text:
+            return "Moonshot fetch returned an empty response."
+        # 对齐官方：标注内容来源并提示引用
+        return FETCH_REMOTE_NOTE + text
     async def _post_with_rotation(
         self,
         endpoint: str,
@@ -169,12 +175,11 @@ class KimiMoonshotClient:
 
     async def _local_fetch_after_remote_error(self, url: str, remote_error: Exception) -> str:
         try:
-            return await self._local_fetch(url)
+            return FETCH_LOCAL_NOTE + await self._local_fetch(url)
         except Exception as exc:
             raise DatasourceError(
                 f"Moonshot fetch failed ({remote_error}); local fallback failed ({exc})"
             ) from exc
-
     async def _local_fetch(self, url: str) -> str:
         timeout = aiohttp.ClientTimeout(total=max(1, self.timeout_seconds))
         headers = {"User-Agent": f"kimi-code/{KIMI_DATASOURCE_VERSION}"}
@@ -202,16 +207,6 @@ class KimiMoonshotClient:
                     )
                     return text or "Local fetch returned an empty response."
         raise DatasourceError(f"Local fetch exceeded {MAX_LOCAL_REDIRECTS} redirects.")
-
-
-def normalize_limit(value: int) -> int:
-    try:
-        limit = int(value)
-    except (TypeError, ValueError):
-        raise ToolInputError("limit must be an integer from 1 to 10.") from None
-    if limit < 1 or limit > 10:
-        raise ToolInputError("limit must be an integer from 1 to 10.")
-    return limit
 
 
 def validate_http_url(value: str) -> str:
@@ -385,7 +380,7 @@ def normalize_text(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def format_search_results(response: Any) -> str:
+def format_search_results(response: Any, *, include_content: bool = False) -> str:
     if not isinstance(response, dict):
         return str(response)
     results = response.get("search_results")
@@ -402,16 +397,20 @@ def format_search_results(response: Any) -> str:
         url = str(item.get("url") or "").strip()
         snippet = str(item.get("snippet") or "").strip()
         date = str(item.get("date") or "").strip()
+        site_name = str(item.get("site_name") or "").strip()
         content = str(item.get("content") or "").strip()
 
         lines = [f"{index}. {title}"]
         if url:
             lines.append(f"URL: {url}")
+        if site_name:
+            lines.append(f"Site: {site_name}")
         if date:
             lines.append(f"Date: {date}")
         if snippet:
             lines.append(snippet)
-        if content:
+        # 服务端现始终返回全文，默认不输出以免刷屏；include_content 时才带
+        if include_content and content:
             lines.append(content)
         blocks.append("\n".join(lines))
 
