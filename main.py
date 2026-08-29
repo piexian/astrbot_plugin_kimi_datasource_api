@@ -138,6 +138,7 @@ class KimiDatasourcePlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self.store = KimiCredentialStore(self)
+        self._env_import_note: str | None = None
         self.pending_logins = PendingLoginRegistry()
         self.oauth = self._build_oauth_client()
         self.datasource = self._build_datasource_client()
@@ -438,7 +439,10 @@ class KimiDatasourcePlugin(Star):
                 device_id_path = root / "device_id"
                 break
         if credentials_path is None:
-            raise KimiPluginError("未找到本机 Kimi Code 凭证。已检查: " + ", ".join(searched))
+            detail = "未找到本机 Kimi Code 凭证。已检查: " + ", ".join(searched)
+            if self._env_import_note:
+                detail += "。" + self._env_import_note
+            raise KimiPluginError(detail)
 
         try:
             data = json.loads(credentials_path.read_text(encoding="utf-8"))
@@ -471,6 +475,7 @@ class KimiDatasourcePlugin(Star):
         return saved_id
 
     def _env_credentials_candidate(self, root: Path) -> Path | None:
+        self._env_import_note: str | None = None
         credentials_dir = root / "credentials"
         try:
             variants = sorted(credentials_dir.glob("kimi-code-env-*.json"))
@@ -485,7 +490,12 @@ class KimiDatasourcePlugin(Star):
         )
         if expected in variants:
             return expected
-        return variants[0] if len(variants) == 1 else None
+        # 哈希算法与官方一致，失配即环境不同；不盲目导入唯一变体，避免错环境 token 被吊销
+        self._env_import_note = (
+            f"发现 {len(variants)} 个 kimi-code-env 凭证，但均与当前 api_url/oauth_host 环境不匹配"
+            f"（期望 {expected.name}）。请检查插件 api_url 是否与本机 kimi-code 环境一致"
+        )
+        return None
 
     async def _poll_login(self, pending: PendingLogin) -> None:
         try:

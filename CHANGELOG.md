@@ -10,6 +10,7 @@
 - 请求头版本号升级为 kimi-datasource 3.3.0；内置 Skill 重写为 12 源路由表与选源铁律。
 - `query_stock` 保留：已在线验证其后端方法 `get_stock_realtime_price` 仍然可用。
 - 对齐 kimi-code 0.39.1 搜索/抓取：`moonshot_search` 请求体瘦身（服务端已忽略 `limit` 等字段，该参数移除），结果新增站点名，`content` 全文仅在 `include_content=true` 时输出；`moonshot_fetch` 输出增加来源说明与引用提示。
+- 修复：`import-local` 在 env 凭证与当前 `api_url`/`oauth_host` 环境失配时不再盲目导入唯一变体（避免错环境 token 被吊销），报错列出期望凭证文件名。
 
 ## v1.0.1
 
