@@ -21,7 +21,7 @@
 - `kimi refresh [账号ID]` 指令 - 管理员强制刷新指定账号，未指定时刷新全部有效账号
 - `kimi logout <账号ID|--all>` 指令 - 管理员删除指定或全部 Kimi OAuth 账号
 - 多 OAuth 轮转 - LLM Tool 调用时在有效账号间轮转，失效账号自动跳过
-- 内置 Skill (`kimi-datasource`) - 引导模型优先使用 datasource 工具查询财经、宏观、企业和学术数据
+- 内置 Skill (`kimi-datasource`) - 引导模型优先使用 datasource 工具查询财经、宏观、企业、法律、学术等 12 个数据源
 - LLM Tool (`query_stock`) - 查询最多 3 个股票代码的实时价格、技术指标、开盘/收盘摘要
 - LLM Tool (`get_data_source_desc`) - 获取 Kimi datasource 的当前 API 文档
 - LLM Tool (`call_data_source_tool`) - 按 datasource 文档调用具体 API
@@ -91,7 +91,7 @@
 - macOS: `~/Library/Application Support/kimi-code`、`~/Library/Application Support/Kimi Code`
 - Windows: `%APPDATA%\kimi-code`、`%APPDATA%\Kimi Code`、`%LOCALAPPDATA%\kimi-code`、`%LOCALAPPDATA%\Kimi Code`、`%USERPROFILE%\.kimi-code`
 
-每个目录下都期待存在 `credentials/kimi-code.json`，如果同目录下存在 `device_id` 也会一并导入。
+每个目录下优先读取 `credentials/kimi-code.json`；不存在时回退到 env 隔离凭证 `credentials/kimi-code-env-*.json`（优先匹配当前 `oauth_host` + `api_url` 对应的环境）。同目录下存在 `device_id` 也会一并导入。
 
 登录期间可发送：
 
@@ -129,9 +129,12 @@ cancel
 插件随包提供只读 Skill：`kimi-datasource`。用于提示模型在下列场景优先调用本插件的 datasource tools，而不是直接泛化联网搜索：
 
 - 股票、财报、估值指标、公司分部、股价历史、期权和持仓
-- World Bank 宏观经济与社会指标
+- World Bank / IMF 宏观经济、汇率、CPI、GDP 预测与国际收支
 - 天眼查企业工商、股东、司法风险、知识产权和经营数据
+- 元典中国法律法规与司法案例
 - arXiv / Scholar 论文检索和作者信息
+- Wind A股分钟线、基金、债券；恒生聚源自然语言选股
+- 美股 SEC 披露文件（10-K/10-Q、Form 4、13F）与 S&P Capital IQ 基本面
 
 ### LLM Tool
 
@@ -141,9 +144,9 @@ Moonshot 网页工具复用同一套 OAuth 账号池和设备头。
 | 工具名 | 用途 |
 |--------|------|
 | `query_stock` | 查询实时股票数据，最多 3 个 ticker |
-| `get_data_source_desc` | 调用具体 datasource API 前获取当前 API 文档 |
+| `get_data_source_desc` | 获取 12 个数据源中指定一个的当前 API 文档 |
 | `call_data_source_tool` | 按文档调用具体 datasource API |
-| `moonshot_search` | 调用 Kimi Code Moonshot search，支持结果数量和页面内容抓取开关 |
+| `moonshot_search` | 调用 Kimi Code Moonshot search；返回标题/链接/站点/日期/摘要，`include_content` 可附带全文 |
 | `moonshot_fetch` | 调用 Kimi Code Moonshot fetch 抓取 URL 正文，远端失败时回落到本地抓取 |
 
 典型流程是先调用 `get_data_source_desc` 获取数据源文档，再调用 `call_data_source_tool`。

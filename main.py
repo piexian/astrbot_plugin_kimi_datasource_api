@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from astrbot.core.utils.session_waiter import FILTERS, DefaultSessionFilter, Ses
 from .constants import (
     DEFAULT_CLIENT_ID,
     DEFAULT_DATASOURCE_API_URL,
+    DEFAULT_KIMI_CODE_BASE_URL,
     DEFAULT_LOGIN_TIMEOUT_SECONDS,
     DEFAULT_OAUTH_HOST,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -122,6 +124,15 @@ def local_kimi_code_roots(env: Mapping[str, str] | None = None) -> list[Path]:
     return roots
 
 
+def env_credential_filename(oauth_host: str, base_url: str) -> str:
+    # 与 kimi-code managed-kimi-code.ts 的 env 隔离凭证命名一致
+    payload = json.dumps(
+        {"oauthHost": oauth_host.strip().rstrip("/"), "baseUrl": base_url.strip().rstrip("/")},
+        separators=(",", ":"),
+    )
+    return f"kimi-code-env-{hashlib.sha256(payload.encode()).hexdigest()[:16]}.json"
+
+
 class KimiDatasourcePlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -143,25 +154,25 @@ class KimiDatasourcePlugin(Star):
             ),
             KimiFunctionTool(
                 name="get_data_source_desc",
-                description="Get the current API documentation for one Kimi data source before calling a specific API.",
+                description="Get the current API documentation for one Kimi data source before calling a specific API. For a simple lookup, choose exactly one specialized source; do not inspect fallback or comparison sources unless the user explicitly asks for a cross-source comparison.",
                 parameters=GET_DATA_SOURCE_DESC_SCHEMA,
                 plugin=self,
             ),
             KimiFunctionTool(
                 name="call_data_source_tool",
-                description="Call one API from a Kimi data source after reading get_data_source_desc.",
+                description="Dispatch one call to the data source selected for the user's request. Always call get_data_source_desc(name) first, then use an api_name and params from that description. For a simple lookup, use one specialized source and stop after its first successful result; do not query fallback or comparison sources unless the user explicitly asks for a cross-source comparison. When the user names a data source, use that source.",
                 parameters=CALL_DATA_SOURCE_TOOL_SCHEMA,
                 plugin=self,
             ),
             KimiFunctionTool(
                 name="moonshot_search",
-                description="Search the web through Kimi Code Moonshot search using the configured Kimi OAuth account.",
+                description=("Search the web for up-to-date information. Each result includes its title, URL, snippet, and source site/date when available. Results are short summaries, not full pages; when a result looks relevant, call moonshot_fetch on its URL to read the full page. Prefer specific queries and refine them when results miss the point; cite source URLs in answers."),
                 parameters=MOONSHOT_SEARCH_SCHEMA,
                 plugin=self,
             ),
             KimiFunctionTool(
                 name="moonshot_fetch",
-                description="Fetch and extract one HTTP or HTTPS URL through Kimi Code Moonshot fetch, with local fallback.",
+                description=("Fetch content from a public HTTP or HTTPS URL via Kimi Moonshot fetch, with local fallback when the remote fetch fails. Returns the main text extracted from the page. No login or session is carried, so pages behind authentication return a login page instead of the real content."),
                 parameters=MOONSHOT_FETCH_SCHEMA,
                 plugin=self,
             ),
@@ -390,17 +401,14 @@ class KimiDatasourcePlugin(Star):
     async def _tool_moonshot_search(
         self,
         query: str,
-        limit: int = 5,
         include_content: bool = False,
     ) -> str:
         return await self._run_tool(
             lambda: self.moonshot.search(
                 query=query,
-                limit=limit,
                 include_content=include_content,
             )
         )
-
     async def _tool_moonshot_fetch(self, url: str) -> str:
         return await self._run_tool(lambda: self.moonshot.fetch_url(url=url))
 
@@ -423,11 +431,12 @@ class KimiDatasourcePlugin(Star):
         for root in local_kimi_code_roots():
             searched.append(str(root))
             candidate = root / "credentials" / "kimi-code.json"
-            if candidate.exists():
+            if not candidate.exists():
+                candidate = self._env_credentials_candidate(root)
+            if candidate is not None and candidate.exists():
                 credentials_path = candidate
                 device_id_path = root / "device_id"
                 break
-
         if credentials_path is None:
             raise KimiPluginError("未找到本机 Kimi Code 凭证。已检查: " + ", ".join(searched))
 
@@ -460,6 +469,23 @@ class KimiDatasourcePlugin(Star):
         )
         await self._append_config_account_id(saved_id)
         return saved_id
+
+    def _env_credentials_candidate(self, root: Path) -> Path | None:
+        credentials_dir = root / "credentials"
+        try:
+            variants = sorted(credentials_dir.glob("kimi-code-env-*.json"))
+        except OSError:
+            return None
+        if not variants:
+            return None
+        api_url = str(self._cfg("api_url", DEFAULT_DATASOURCE_API_URL) or DEFAULT_DATASOURCE_API_URL).rstrip("/")
+        base_url = api_url[: -len("/tools")] if api_url.endswith("/tools") else DEFAULT_KIMI_CODE_BASE_URL
+        expected = credentials_dir / env_credential_filename(
+            str(self._cfg("oauth_host", DEFAULT_OAUTH_HOST) or DEFAULT_OAUTH_HOST), base_url
+        )
+        if expected in variants:
+            return expected
+        return variants[0] if len(variants) == 1 else None
 
     async def _poll_login(self, pending: PendingLogin) -> None:
         try:
