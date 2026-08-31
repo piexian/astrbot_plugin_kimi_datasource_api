@@ -1,4 +1,4 @@
-# Kimi Datasource API (astrbot_plugin_kimi_datasource_api)
+# Kimi 专业工具 (astrbot_plugin_kimi_datasource_api)
 
 为 AstrBot LLM 提供 Kimi datasource 专业数据库工具。
 
