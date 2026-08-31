@@ -1,5 +1,5 @@
 name: astrbot_plugin_kimi_datasource_api
-display_name: Kimi Datasource API
+display_name: Kimi 专业工具
 desc: 为 AstrBot LLM 提供 Kimi datasource 专业数据库工具。
 version: v1.1.0
 author: piexian
