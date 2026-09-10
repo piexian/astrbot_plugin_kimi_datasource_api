@@ -82,6 +82,7 @@ class KimiCredentialStore:
         account_id: str,
         device_id: str,
         session_id: str,
+        local_credentials_path: str = "",
     ) -> str:
         normalized_id = await self.allocate_account_id(account_id)
         accounts = await self.list_accounts()
@@ -90,6 +91,7 @@ class KimiCredentialStore:
             device_id=device_id,
             last_login_session=session_id,
             last_refresh_at=None,
+            local_credentials_path=local_credentials_path,
         )
         await self._save_accounts(accounts)
         return normalized_id
@@ -103,6 +105,7 @@ class KimiCredentialStore:
             device_id=device_id,
             last_login_session=str(previous.get("last_login_session") or ""),
             last_refresh_at=utc_now_iso(),
+            local_credentials_path=str(previous.get("local_credentials_path") or ""),
         )
         await self._save_accounts(accounts)
 
@@ -192,6 +195,7 @@ class KimiCredentialStore:
         device_id: str,
         last_login_session: str,
         last_refresh_at: str | None,
+        local_credentials_path: str = "",
     ) -> dict[str, Any]:
         now = utc_now_iso()
         return {
@@ -206,6 +210,8 @@ class KimiCredentialStore:
             "updated_at": now,
             "last_refresh_at": last_refresh_at,
             "last_login_session": last_login_session,
+            # 从本机 CLI 导入时记录来源文件，刷新时与 CLI 互斥并原子回写
+            "local_credentials_path": local_credentials_path,
         }
 
 

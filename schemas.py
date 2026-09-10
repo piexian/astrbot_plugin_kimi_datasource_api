@@ -40,7 +40,14 @@ GET_DATA_SOURCE_DESC_SCHEMA = {
                 "wind = A-share intraday minute series, funds, bonds (map PE/PB/ROE-style field names via wind_search_fields first); "
                 "gildata = natural-language stock/fund screening; "
                 "sec_edgar = US filings (10-K/10-Q, S-1, Form 4, 13F, 8-K); "
-                "sp_data = S&P fundamentals (consensus estimates, valuation ratios, transcripts)."
+                "sp_data = S&P fundamentals (consensus estimates, valuation ratios, transcripts); "
+                "china_nda = CN government open data catalogs (National Data Administration registry + provincial platforms); "
+                "china_nbs = CN NBS macro indicators and time series (national / provincial / major-city scopes); "
+                "china_standards = CN standards (GB national, HB industry, DB local, TT association); "
+                "who / fao / unsd / ecb / eurostat / unicef / oecd / fred = international organization open data "
+                "(global health, food & agriculture, UN statistics, ECB & EU statistics, child indicators, OECD datasets, US & global macro series); "
+                "xhcj = Xinhua Finance (CNFIC) news flashes, announcements, and policies; "
+                "caixin = Caixin database (600+ data APIs, discover via caixin_api_search first)."
             ),
         },
     },
@@ -53,7 +60,7 @@ CALL_DATA_SOURCE_TOOL_SCHEMA = {
     "properties": {
         "data_source_name": {
             "type": "string",
-            "description": "Data source name returned or documented by get_data_source_desc.",
+            "description": "The data source selected via get_data_source_desc. When the user names a source, pass that source.",
         },
         "api_name": {
             "type": "string",

@@ -55,13 +55,13 @@
       "api_url": {
         "type": "string",
         "description": "Datasource API 地址",
-        "hint": "默认使用 Kimi Code 官方 datasource endpoint",
+        "hint": "默认使用 Kimi Code 官方 datasource endpoint；global 区填 https://api.kimi.ai/coding/v1/tools",
         "default": "https://api.kimi.com/coding/v1/tools"
       },
       "response_parse_mode": {
         "type": "string",
         "description": "响应解析模式",
-        "hint": "official 对齐当前 Kimi Code MCP；legacy_zip 优先 assistant 文本",
+        "hint": "official 对齐官方 MCP（assistant 通道优先，user 兜底）；legacy_zip 只要 user 通道的干净 data_preview",
         "default": "official",
         "options": [
           "official",

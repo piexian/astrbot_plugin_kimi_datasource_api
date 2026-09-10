@@ -2,19 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
 import aiohttp
 
+from astrbot.api import logger
 from .constants import (
     DEFAULT_CLIENT_ID,
     DEFAULT_OAUTH_HOST,
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
-    KIMI_DATASOURCE_VERSION,
+    KIMI_CODE_CLI_VERSION,
+    PLUGIN_NAME,
 )
 from .identity import oauth_device_headers
+from .local_credentials import (
+    CredentialRefreshLock,
+    local_credentials_file,
+    local_refresh_token,
+    parse_local_tokens,
+    write_local_tokens,
+)
 from .models import (
     DeviceAuthorization,
     DevicePollResult,
@@ -38,7 +48,7 @@ class KimiOAuthClient:
         *,
         oauth_host: str = DEFAULT_OAUTH_HOST,
         client_id: str = DEFAULT_CLIENT_ID,
-        version: str = KIMI_DATASOURCE_VERSION,
+        version: str = KIMI_CODE_CLI_VERSION,
         timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         proxy: str = "",
         max_refresh_retries: int = 3,
@@ -134,7 +144,11 @@ class KimiOAuthClient:
                 raise last_error from exc
 
             if status == 200 and isinstance(data.get("access_token"), str):
-                return token_from_oauth_payload(data, now_seconds())
+                # 对齐官方：响应没带新 refresh_token 时沿用本次请求里的那个
+                payload = dict(data)
+                if not isinstance(payload.get("refresh_token"), str) or not payload["refresh_token"]:
+                    payload["refresh_token"] = refresh_token
+                return token_from_oauth_payload(payload, now_seconds())
 
             error_code = data.get("error")
             if status in {401, 403} or error_code == "invalid_grant":
@@ -166,17 +180,57 @@ class KimiOAuthClient:
             if not token.refresh_token:
                 raise OAuthError(f"Kimi account {account_id} has no refresh_token; re-login required.")
 
+            credentials = await self.store.load_credentials(account_id) or {}
+            local_path = local_credentials_file(credentials)
+            lock: CredentialRefreshLock | None = None
+            if local_path is not None:
+                # 与同机 kimi-code CLI 抢同一把锁，避免两边互相吊销 refresh_token
+                lock = CredentialRefreshLock(local_path)
+                if not await lock.acquire():
+                    raise OAuthError(f"Kimi 凭证刷新锁被占用，账号 {account_id} 请稍后重试。")
             try:
-                refreshed = await self.refresh_access_token(token.refresh_token)
+                adopted = await self._adopt_local_token(account_id, local_path, token)
+                if adopted is not None:
+                    token = adopted
+                    # 对齐官方：等待锁期间 token 已被轮换时，force 也直接返回新 token 不再刷
+                    if force or not self._should_refresh(token, force):
+                        return token.access_token
+                try:
+                    refreshed = await self.refresh_access_token(token.refresh_token)
+                except OAuthUnauthorizedError:
+                    recovery = await self.store.load_token(account_id)
+                    if recovery and recovery.refresh_token != token.refresh_token:
+                        return recovery.access_token
+                    recovery = await self._adopt_local_token(account_id, local_path, token)
+                    if recovery is not None and recovery.expires_at > now_seconds():
+                        return recovery.access_token
+                    await self.store.mark_revoked(account_id)
+                    raise
                 device_id = await self.store.get_device_id()
                 await self.store.save_refreshed_token(account_id, refreshed, device_id=device_id)
+                if local_path is not None and local_refresh_token(local_path) == token.refresh_token:
+                    # 文件仍持有我们刚消费掉的 refresh_token：回写新凭证，否则同机 CLI 登录态失效
+                    if not write_local_tokens(local_path, refreshed):
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] 回写本机凭证 {local_path} 失败，同机 kimi-code CLI 登录态可能失效"
+                        )
                 return refreshed.access_token
-            except OAuthUnauthorizedError:
-                recovery = await self.store.load_token(account_id)
-                if recovery and recovery.refresh_token != token.refresh_token:
-                    return recovery.access_token
-                await self.store.mark_revoked(account_id)
-                raise
+            finally:
+                if lock is not None:
+                    await lock.release()
+
+    async def _adopt_local_token(
+        self, account_id: str, local_path: Path | None, token: TokenInfo
+    ) -> TokenInfo | None:
+        """本机 CLI 已轮换过凭证时采纳它，避免用掉被吊销的 refresh_token。"""
+        if local_path is None:
+            return None
+        local_token = parse_local_tokens(local_path)
+        if local_token is None or local_token.refresh_token == token.refresh_token:
+            return None
+        device_id = await self.store.get_device_id()
+        await self.store.save_refreshed_token(account_id, local_token, device_id=device_id)
+        return local_token
 
     async def _load_account_token(self, account_id: str | None) -> tuple[str, TokenInfo | None]:
         credentials = await self.store.load_credentials(account_id)

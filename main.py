@@ -22,7 +22,8 @@ from .constants import (
     DEFAULT_LOGIN_TIMEOUT_SECONDS,
     DEFAULT_OAUTH_HOST,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
-    KIMI_DATASOURCE_VERSION,
+    KIMI_CODE_CLI_VERSION,
+    KIMI_REGION_PROFILES,
     PLUGIN_NAME,
 )
 from .datasource import KimiDatasourceClient
@@ -161,7 +162,7 @@ class KimiDatasourcePlugin(Star):
             ),
             KimiFunctionTool(
                 name="call_data_source_tool",
-                description="Dispatch one call to the data source selected for the user's request. Always call get_data_source_desc(name) first, then use an api_name and params from that description. For a simple lookup, use one specialized source and stop after its first successful result; do not query fallback or comparison sources unless the user explicitly asks for a cross-source comparison. When the user names a data source, use that source.",
+                description="Dispatch one call to the data source selected for the user's request. Always call get_data_source_desc(name) first, then use an api_name and params from that description. For a simple lookup, use one specialized source and stop once a result covers the user's question; do not query fallback or comparison sources unless the user explicitly asks for a cross-source comparison. When the user names a data source, use that source.",
                 parameters=CALL_DATA_SOURCE_TOOL_SCHEMA,
                 plugin=self,
             ),
@@ -194,7 +195,7 @@ class KimiDatasourcePlugin(Star):
             self.store,
             oauth_host=str(self._cfg("oauth_host", DEFAULT_OAUTH_HOST) or DEFAULT_OAUTH_HOST),
             client_id=DEFAULT_CLIENT_ID,
-            version=KIMI_DATASOURCE_VERSION,
+            version=KIMI_CODE_CLI_VERSION,
             timeout_seconds=int(self._cfg("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)),
             proxy=str(self._cfg("proxy", "") or ""),
         )
@@ -212,9 +213,16 @@ class KimiDatasourcePlugin(Star):
         )
 
     def _build_moonshot_client(self) -> KimiMoonshotClient:
+        # 官方由 KIMI_CODE_BASE_URL 派生 /search 与 /fetch，并支持 KIMI_WEB_*_BASE_URL 覆盖
+        api_url = str(self._cfg("api_url", DEFAULT_DATASOURCE_API_URL) or DEFAULT_DATASOURCE_API_URL).rstrip("/")
+        base_url = api_url[: -len("/tools")] if api_url.endswith("/tools") else DEFAULT_KIMI_CODE_BASE_URL
+        search_url = os.environ.get("KIMI_WEB_SEARCH_BASE_URL", "").strip() or f"{base_url}/search"
+        fetch_url = os.environ.get("KIMI_WEB_FETCH_BASE_URL", "").strip() or f"{base_url}/fetch"
         return KimiMoonshotClient(
             self.store,
             self.oauth,
+            search_url=search_url,
+            fetch_url=fetch_url,
             timeout_seconds=int(self._cfg("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)),
             proxy=str(self._cfg("proxy", "") or ""),
         )
@@ -470,6 +478,7 @@ class KimiDatasourcePlugin(Star):
             account_id=account_id,
             device_id=device_id,
             session_id=session_id,
+            local_credentials_path=str(credentials_path),
         )
         await self._append_config_account_id(saved_id)
         return saved_id
@@ -485,15 +494,29 @@ class KimiDatasourcePlugin(Star):
             return None
         api_url = str(self._cfg("api_url", DEFAULT_DATASOURCE_API_URL) or DEFAULT_DATASOURCE_API_URL).rstrip("/")
         base_url = api_url[: -len("/tools")] if api_url.endswith("/tools") else DEFAULT_KIMI_CODE_BASE_URL
-        expected = credentials_dir / env_credential_filename(
-            str(self._cfg("oauth_host", DEFAULT_OAUTH_HOST) or DEFAULT_OAUTH_HOST), base_url
-        )
+        oauth_host = str(self._cfg("oauth_host", DEFAULT_OAUTH_HOST) or DEFAULT_OAUTH_HOST).strip().rstrip("/")
+        # 官方 resolveKimiCodeOAuthKey：默认环境走 kimi-code.json 默认槽，不会写 env 隔离文件
+        if oauth_host == DEFAULT_OAUTH_HOST.rstrip("/") and base_url == DEFAULT_KIMI_CODE_BASE_URL:
+            expected = credentials_dir / "kimi-code.json"
+        else:
+            expected = credentials_dir / env_credential_filename(oauth_host, base_url)
         if expected in variants:
             return expected
         # 哈希算法与官方一致，失配即环境不同；不盲目导入唯一变体，避免错环境 token 被吊销
+        labels = {"mainland-cn": "kimi-code.json"}
+        for region, profile in KIMI_REGION_PROFILES.items():
+            if region in labels:
+                continue
+            labels[region] = env_credential_filename(profile["oauth_host"], profile["base_url"])
+        detected = [
+            f"{region}:{credentials_dir / filename}"
+            for region, filename in labels.items()
+            if (credentials_dir / filename).exists()
+        ]
+        hint = f"；本机已登录 region：{'、'.join(detected)}" if detected else ""
         self._env_import_note = (
             f"发现 {len(variants)} 个 kimi-code-env 凭证，但均与当前 api_url/oauth_host 环境不匹配"
-            f"（期望 {expected.name}）。请检查插件 api_url 是否与本机 kimi-code 环境一致"
+            f"（期望 {expected.name}）。请检查插件 api_url 是否与本机 kimi-code 环境一致{hint}"
         )
         return None
 

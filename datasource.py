@@ -225,15 +225,21 @@ def extract_text(response: Any, *, mode: str = "official") -> str:
     if not isinstance(response, dict):
         return str(response)
     if response.get("is_success") is False:
-        message = extract_user_text(response.get("error")) or json.dumps(response, ensure_ascii=False)
+        message = (
+            extract_role_text(response.get("error"), "assistant")
+            or extract_user_text(response.get("error"))
+            or json.dumps(response, ensure_ascii=False)
+        )
         raise DatasourceError(f"Tool API returned an error: {message}")
 
     result = response.get("result")
     if mode == "legacy_zip":
-        text = extract_role_text(result, "assistant") or extract_role_text(result, "user")
-    else:
-        # official: user 通道是干净的 data_preview，assistant 通道作为兜底
+        # 旧行为：user 通道只有干净的 data_preview，assistant 兜底
         text = extract_role_text(result, "user") or extract_role_text(result, "assistant")
+    else:
+        # 对齐官方 mjs extractChannelText：assistant 优先、user 兜底；
+        # 否则 caixin 这类 user 只回空 data_preview 的源会丢内容
+        text = extract_role_text(result, "assistant") or extract_role_text(result, "user")
     if text:
         return text
     return f"Tool API succeeded but did not return user text. Raw response: {json.dumps(response, ensure_ascii=False)}"
@@ -254,7 +260,7 @@ def extract_role_text(value: Any, role: str) -> str | None:
         for item in parts
         if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str) and item["text"]
     )
-    return text or None
+    return text.strip() or None
 
 
 REQUEST_ID_HEADER_KEYS = ("x-request-id", "x-trace-id", "x-msh-request-id", "x-msh-trace-id", "request-id")

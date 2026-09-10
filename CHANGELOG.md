@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.0
+
+- 对齐官方 kimi-datasource 3.4.0：数据源枚举 12 → 25，新增 `china_nda`、`china_nbs`、`china_standards`、`who`、`fao`、`unsd`、`ecb`、`eurostat`、`unicef`、`oecd`、`fred`、`xhcj`、`caixin`（已在线验证 25 源全部可达，`china_nbs`/`fred`/`caixin` 实测返回真实数据）。
+- 同步官方 3.4.0 工具与 schema 描述：`stop once a result covers the user's question`、`data_source_name` 字段说明、逐源能力边界；内置 Skill 改为 25 源路由表，发现类调用（`caixin_api_search`、`wind_search_fields`、天眼查公司搜索）不再受“一次调用”限制。
+- 修复响应通道优先级：`official` 改为 assistant 优先、user 兜底（与官方 `extractChannelText` 一致）。此前 user 优先会让 `caixin` 这类只回空 `data_preview` 的源丢掉正文；旧行为保留为 `legacy_zip`。
+- 请求头版本位升级为 kimi-datasource 3.4.0；Moonshot search/fetch 改用 CLI 版本位 `kimi-code-cli/0.42.0`，并对齐官方由 base URL 派生 `/search`、`/fetch`，支持 `KIMI_WEB_SEARCH_BASE_URL` / `KIMI_WEB_FETCH_BASE_URL` 覆盖。
+- refresh 响应未轮换 `refresh_token` 时沿用旧值（对齐官方 token 事务层），不再整次刷新失败。
+- 本机凭证共存：`kimi import-local` 记录来源文件，刷新前抢官方同款 `oauth/<name>.lock` 跨进程锁并回读，若 CLI 已轮换则直接采纳；刷新成功后原子回写来源文件，避免与同机 kimi-code CLI 互相吊销。
+- 凭证导入诊断支持 kimi-code region profiles：识别 `mainland-cn`（.com）与 `global`（`auth.kimi.ai` / `api.kimi.ai`）登录，环境失配时报出实际 region。
+
 ## v1.1.0
 
 - 对齐官方 kimi-datasource 3.3.0：`get_data_source_desc` 数据源枚举补齐至 12 个，新增 `yuandian_law`、`wind`、`imf`、`gildata`、`sec_edgar`、`sp_data`（已在线验证后端可用）。

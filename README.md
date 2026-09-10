@@ -21,13 +21,13 @@
 - `kimi refresh [账号ID]` 指令 - 管理员强制刷新指定账号，未指定时刷新全部有效账号
 - `kimi logout <账号ID|--all>` 指令 - 管理员删除指定或全部 Kimi OAuth 账号
 - 多 OAuth 轮转 - LLM Tool 调用时在有效账号间轮转，失效账号自动跳过
-- 内置 Skill (`kimi-datasource`) - 引导模型优先使用 datasource 工具查询财经、宏观、企业、法律、学术等 12 个数据源
+- 内置 Skill (`kimi-datasource`) - 引导模型优先使用 datasource 工具查询财经、宏观、企业、法律、学术、国标、国际组织、财经资讯等 25 个数据源
 - LLM Tool (`query_stock`) - 查询最多 3 个股票代码的实时价格、技术指标、开盘/收盘摘要
-- LLM Tool (`get_data_source_desc`) - 获取 Kimi datasource 的当前 API 文档
+- LLM Tool (`get_data_source_desc`) - 获取 25 个数据源中指定一个的当前 API 文档
 - LLM Tool (`call_data_source_tool`) - 按 datasource 文档调用具体 API
 - LLM Tool (`moonshot_search`) - 通过 Kimi Code Moonshot search 使用 Kimi OAuth 执行网页检索
 - LLM Tool (`moonshot_fetch`) - 通过 Kimi Code Moonshot fetch 抓取 URL 正文，远端失败时本地兜底
-- 自动 refresh - tool 调用前自动检查并刷新即将过期的 access token
+- 自动 refresh - tool 调用前自动检查并刷新即将过期的 access token；导入自本机的凭证与同机 kimi-code CLI 共用刷新锁并原子回写，互不吊销
 - 响应文件落盘 - 将上游 `response.files` 安全保存到插件数据目录
 
 ## 安装
@@ -57,8 +57,8 @@
 
 | 配置项 | 类型 | 必填 | 说明 |
 |--------|------|------|------|
-| `api_url` | string | 否 | Kimi datasource API endpoint（默认: https://api.kimi.com/coding/v1/tools） |
-| `response_parse_mode` | string | 否 | 响应解析模式：`official` / `legacy_zip`（默认: official） |
+| `api_url` | string | 否 | Kimi datasource API endpoint（默认: https://api.kimi.com/coding/v1/tools；global 区填 https://api.kimi.ai/coding/v1/tools）。Moonshot search/fetch 由该地址派生，也可用 `KIMI_WEB_SEARCH_BASE_URL` / `KIMI_WEB_FETCH_BASE_URL` 覆盖 |
+| `response_parse_mode` | string | 否 | 响应解析模式：`official`（assistant 通道优先，同官方）/ `legacy_zip`（user 通道优先，只要干净 data_preview）（默认: official） |
 | `save_response_files` | bool | 否 | 保存上游 `response.files` 到插件数据目录（默认: true） |
 
 ### 账号设置
@@ -82,7 +82,7 @@
 
 插件会返回 Kimi 授权链接、备用验证码和剩余时间。用户在浏览器完成授权后无需再发消息，插件会后台轮询并自动保存凭证。未指定账号 ID 时会自动分配 `account-N`。
 
-如果运行 AstrBot 的同一系统用户已经登录过 Kimi Code，可以直接执行 `kimi import-local [账号ID]` 导入本地凭证。未指定账号 ID 时默认写入 `local-kimi-code`。
+如果运行 AstrBot 的同一系统用户已经登录过 Kimi Code，可以直接执行 `kimi import-local [账号ID]` 导入本地凭证。未指定账号 ID 时默认写入 `local-kimi-code`。导入的账号会记住来源文件：刷新时与同机 kimi-code CLI 抢同一把 `oauth/<name>.lock` 锁，刷新成功后原子回写该文件，因此两边不会互相吊销 `refresh_token`。
 
 `kimi import-local` 会按顺序检查这些位置：
 
@@ -144,7 +144,7 @@ Moonshot 网页工具复用同一套 OAuth 账号池和设备头。
 | 工具名 | 用途 |
 |--------|------|
 | `query_stock` | 查询实时股票数据，最多 3 个 ticker |
-| `get_data_source_desc` | 获取 12 个数据源中指定一个的当前 API 文档 |
+| `get_data_source_desc` | 获取 25 个数据源中指定一个的当前 API 文档 |
 | `call_data_source_tool` | 按文档调用具体 datasource API |
 | `moonshot_search` | 调用 Kimi Code Moonshot search；返回标题/链接/站点/日期/摘要，`include_content` 可附带全文 |
 | `moonshot_fetch` | 调用 Kimi Code Moonshot fetch 抓取 URL 正文，远端失败时回落到本地抓取 |

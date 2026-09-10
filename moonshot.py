@@ -15,7 +15,7 @@ from .constants import (
     DEFAULT_MOONSHOT_FETCH_URL,
     DEFAULT_MOONSHOT_SEARCH_URL,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
-    KIMI_DATASOURCE_VERSION,
+    KIMI_CODE_CLI_VERSION,
 )
 from .datasource import account_rotation, required_string
 from .identity import moonshot_headers
@@ -156,7 +156,7 @@ class KimiMoonshotClient:
                 async with session.post(
                     endpoint,
                     json=payload,
-                    headers=moonshot_headers(token, device_id, KIMI_DATASOURCE_VERSION, accept=accept),
+                    headers=moonshot_headers(token, device_id, KIMI_CODE_CLI_VERSION, accept=accept),
                     proxy=self.proxy,
                 ) as response:
                     body = await response.text()
@@ -182,7 +182,7 @@ class KimiMoonshotClient:
             ) from exc
     async def _local_fetch(self, url: str) -> str:
         timeout = aiohttp.ClientTimeout(total=max(1, self.timeout_seconds))
-        headers = {"User-Agent": f"kimi-code/{KIMI_DATASOURCE_VERSION}"}
+        headers = {"User-Agent": f"kimi-code-cli/{KIMI_CODE_CLI_VERSION}"}
         current_url = url
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for _ in range(MAX_LOCAL_REDIRECTS + 1):

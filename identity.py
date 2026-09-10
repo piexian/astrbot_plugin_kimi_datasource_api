@@ -6,6 +6,7 @@ import socket
 from uuid import uuid4
 
 from .constants import (
+    KIMI_CODE_CLI_VERSION,
     KIMI_DATASOURCE_PLATFORM,
     KIMI_DATASOURCE_VERSION,
     KIMI_OAUTH_PLATFORM,
@@ -70,7 +71,7 @@ def datasource_headers(token: str, device_id: str, version: str = KIMI_DATASOURC
 def moonshot_headers(
     token: str,
     device_id: str,
-    version: str = KIMI_DATASOURCE_VERSION,
+    version: str = KIMI_CODE_CLI_VERSION,
     *,
     accept: str = "",
 ) -> dict[str, str]:
@@ -85,7 +86,8 @@ def moonshot_headers(
         "X-Msh-Device-Model": device_model(),
         "X-Msh-Os-Version": device_os_version(),
         "X-Msh-Device-Id": ascii_header(env.get("KIMI_MSH_DEVICE_ID", device_id)),
-        "User-Agent": f"kimi-code/{version}",
+        # 官方 search/fetch 由 CLI 直发，UA 产品位是 kimi-code-cli
+        "User-Agent": f"kimi-code-cli/{version}",
     }
     if accept:
         headers["Accept"] = accept
