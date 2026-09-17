@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.0
+
+- 对齐 kimi-code CLI 2.0.0：CLI 版本位请求头升级为 2.0.0；OAuth device/token 请求补齐 `User-Agent: kimi-code-cli/<ver>`（官方 2.0.0 起 `createKimiDefaultHeaders` 行为）。
+- datasource / search / fetch 设备指纹头补齐 `KIMI_MSH_DEVICE_NAME` / `KIMI_MSH_DEVICE_MODEL` / `KIMI_MSH_OS_VERSION` 环境覆盖（官方 mjs 同款）；Windows 下 X-Msh-Os-Version / Device-Model 改发内核版本号（对齐 Node `os.release()`）。
+- 刷新锁支持官方 `KIMI_DISABLE_OAUTH_LOCK=1` 停用开关。
+- 更正：官方 2.0.0 起 refresh 响应缺 refresh_token 会直接报错；本插件“沿用旧值”自此为刻意的防御性偏离，防止服务端省略时把账号刷死。
+
 ## v1.2.0
 
 - 对齐官方 kimi-datasource 3.4.0：数据源枚举 12 → 25，新增 `china_nda`、`china_nbs`、`china_standards`、`who`、`fao`、`unsd`、`ecb`、`eurostat`、`unicef`、`oecd`、`fred`、`xhcj`、`caixin`（已在线验证 25 源全部可达，`china_nbs`/`fred`/`caixin` 实测返回真实数据）。
