@@ -1,11 +1,11 @@
 PLUGIN_NAME = "astrbot_plugin_kimi_datasource_api"
 PLUGIN_DISPLAY_NAME = "Kimi Datasource API"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 
 # 对齐官方 kimi-datasource 插件版本号，用于 X-Msh-Version / User-Agent 请求头
 KIMI_DATASOURCE_VERSION = "3.4.0"
-# moonshot search/fetch 由 kimi-code CLI 直发，参考版本用于头里的版本位
-KIMI_CODE_CLI_VERSION = "0.42.0"
+# moonshot search/fetch 与 OAuth 设备头由 kimi-code CLI 直发，参考版本用于头里的版本位
+KIMI_CODE_CLI_VERSION = "2.0.0"
 KIMI_OAUTH_PLATFORM = "kimi_code_cli"
 KIMI_DATASOURCE_PLATFORM = "kimi-code-cli"
 

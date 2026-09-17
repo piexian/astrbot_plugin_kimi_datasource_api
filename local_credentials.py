@@ -134,7 +134,12 @@ class CredentialRefreshLock:
 
     @property
     def enabled(self) -> bool:
-        return self.path is not None and os.name != "nt"
+        # 与官方一致：Windows 跳过，且 KIMI_DISABLE_OAUTH_LOCK=1 时彻底停用跨进程锁
+        return (
+            self.path is not None
+            and os.name != "nt"
+            and os.environ.get("KIMI_DISABLE_OAUTH_LOCK") != "1"
+        )
 
     async def acquire(self) -> bool:
         if not self.enabled or self.path is None:
