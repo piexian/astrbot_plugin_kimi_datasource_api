@@ -104,6 +104,7 @@ class KimiMoonshotClient:
         errors: list[str] = []
         has_cooldown = False
         has_file_error = False
+        permission_error: DatasourceHTTPError | None = None
         for account_id in account_rotation(account_ids, start_id):
             try:
                 async with self.store.cooldown.request(account_id):
@@ -124,6 +125,11 @@ class KimiMoonshotClient:
             except QuotaCooldownError as exc:
                 has_cooldown = True
                 errors.append(str(exc))
+            except DatasourceHTTPError as exc:
+                if exc.status != 403:
+                    raise
+                permission_error = exc
+                errors.append(f"{account_id}: {exc}")
             except CredentialFileError as exc:
                 has_file_error = True
                 errors.append(f"{account_id}: {exc}")
@@ -133,6 +139,10 @@ class KimiMoonshotClient:
         message = "; ".join(errors) if errors else "all accounts failed"
         if has_cooldown:
             raise QuotaCooldownError(f"Kimi 当前无可用账号：{message}")
+        if permission_error is not None:
+            raise DatasourceHTTPError(403, json.dumps({"error": {
+                "type": permission_error.error_type, "message": f"Kimi 当前无可用账号：{message}",
+            }}))
         if has_file_error:
             raise CredentialFileError(f"Kimi 当前无可用凭据文件：{message}")
         raise OAuthUnauthorizedError(f"Kimi Moonshot authorization failed for every configured account: {message}")

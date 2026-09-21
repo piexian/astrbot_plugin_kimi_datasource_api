@@ -62,6 +62,44 @@ async def test_403_never_refreshes_or_revokes(kind, body, store, http_responses)
     assert await store.list_account_ids(include_revoked=False) == ["test"]
     client._local_fetch.assert_not_awaited()
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["datasource", "search", "fetch"])
+@pytest.mark.parametrize("outcome", ["success", "permission", "monthly", "auth"])
+async def test_permission_403_rotates_without_refresh_or_revocation(kind, outcome, store, http_responses):
+    accounts = await store.list_accounts()
+    accounts["test2"] = {**accounts["test"], "device_id": "device-2"}
+    await store._save_accounts(accounts)
+    oauth = SimpleNamespace(ensure_fresh=AsyncMock(return_value="test-access-secret"))
+    client = make_client(kind, store, oauth)
+    client._local_fetch = AsyncMock(side_effect=AssertionError("403 must not trigger fallback"))
+    permission = {"error": {"type": "permission_denied", "message": "not allowed"}}
+    http_responses.responses.append((403, permission))
+    if outcome == "success":
+        http_responses.responses.append((200, {}))
+        await call_client(kind, client)
+    elif outcome == "monthly":
+        http_responses.responses.append((403, QUOTA_ERROR))
+        with pytest.raises(QuotaCooldownError):
+            await call_client(kind, client)
+    else:
+        http_responses.responses.extend([(403, permission)] if outcome == "permission" else [(401, {}), (401, {})])
+        with pytest.raises(DatasourceHTTPError) as caught:
+            await call_client(kind, client)
+        assert caught.value.status == 403
+        assert caught.value.error_type == "permission_denied"
+        assert "not allowed" in str(caught.value)
+    calls = oauth.ensure_fresh.await_args_list
+    expected = [("test", False), ("test2", False)]
+    if outcome == "auth":
+        expected.append(("test2", True))
+    assert [(call.args[0], call.kwargs["force"]) for call in calls] == expected
+    assert (await store.load_credentials("test"))["status"] == "valid"
+    assert (await store.load_credentials("test2"))["status"] == ("revoked" if outcome == "auth" else "valid")
+    assert await store.cooldown.get("test") is None
+    assert bool(await store.cooldown.get("test2")) == (outcome == "monthly")
+    client._local_fetch.assert_not_awaited()
+
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["datasource", "search"])
