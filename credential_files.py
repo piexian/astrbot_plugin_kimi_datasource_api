@@ -139,6 +139,7 @@ def credential_document(account_id: str, data: dict) -> dict:
 
 
 def env_credential_filename(oauth_host: str, base_url: str) -> str:
+    # 官方 CLI 的环境文件标识，仅对端点地址求摘要，不用于密码校验。
     payload = json.dumps({"oauthHost": oauth_host.strip().rstrip("/"), "baseUrl": base_url.strip().rstrip("/")}, separators=(",", ":"))
     return f"kimi-code-env-{hashlib.sha256(payload.encode()).hexdigest()[:16]}.json"
 

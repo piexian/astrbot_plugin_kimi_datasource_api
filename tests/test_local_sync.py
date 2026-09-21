@@ -27,8 +27,8 @@ from astrbot_plugin_kimi_datasource_api.storage import KimiCredentialStore
 FAILURES: list[str] = []
 
 
-def check(label: str, ok: bool, detail: str = "") -> None:
-    print(f"{'PASS' if ok else 'FAIL'}  {label}{(' :: ' + detail) if detail else ''}")
+def check(label: str, ok: bool) -> None:
+    print(f"{'PASS' if ok else 'FAIL'}  {label}")
     if not ok:
         FAILURES.append(label)
 
@@ -104,9 +104,9 @@ async def scenario_rotate_and_write_back(tmp: Path) -> None:
     )
     got = await client.ensure_fresh("local", force=True)
     saved = json.loads(cred_file.read_text(encoding="utf-8"))
-    check("刷新后返回新 access_token", got == "acc-new", got)
-    check("refresh 只发一次请求", calls["n"] == 1, str(calls["n"]))
-    check("原子回写本机凭证", saved["refresh_token"] == "ref-new" and saved["access_token"] == "acc-new", json.dumps(saved)[:120])
+    check("刷新后返回新 access_token", got == "acc-new")
+    check("refresh 只发一次请求", calls["n"] == 1)
+    check("原子回写本机凭证", saved["refresh_token"] == "ref-new" and saved["access_token"] == "acc-new")
     check("回写后无临时文件残留", not list(cred_file.parent.glob("*.tmp*")))
     check("锁目录已释放", not (tmp / "oauth" / "kimi-code.lock").exists())
     creds = await store.load_credentials("local")
@@ -139,7 +139,7 @@ async def scenario_adopt_local_winner(tmp: Path) -> None:
         encoding="utf-8",
     )
     got = await client.ensure_fresh("local")
-    check("CLI 已轮换且新 token 未过期时不再 refresh", got == "acc-cli", got)
+    check("CLI 已轮换且新 token 未过期时不再 refresh", got == "acc-cli")
     creds = await store.load_credentials("local")
     check("账号池同步为 CLI 的新 refresh_token", creds.get("refresh_token") == "ref-cli")
 
@@ -172,8 +172,8 @@ async def scenario_invalid_grant_adopts_local(tmp: Path) -> None:
     )
     got = await client.ensure_fresh("local")
     creds = await store.load_credentials("local")
-    check("refresh 被拒后采纳本机新 token", got == "acc-cli2", got)
-    check("账号未被标记 revoked", creds.get("status") == "valid", str(creds.get("status")))
+    check("refresh 被拒后采纳本机新 token", got == "acc-cli2")
+    check("账号未被标记 revoked", creds.get("status") == "valid")
 
 
 async def scenario_no_revocation_when_file_untouched(tmp: Path) -> None:
@@ -190,7 +190,7 @@ async def scenario_no_revocation_when_file_untouched(tmp: Path) -> None:
     )
     try:
         await client.ensure_fresh("local", force=True)
-        check("来源文件未轮换时仍按吊销处理", False, "未抛 OAuthUnauthorizedError")
+        check("来源文件未轮换时仍按吊销处理", False)
     except OAuthUnauthorizedError:
         creds = await store.load_credentials("local")
         check("来源文件未轮换时仍按吊销处理", creds.get("status") == "revoked")
@@ -211,7 +211,7 @@ async def scenario_refresh_without_rotation(tmp: Path) -> None:
     got = await client.ensure_fresh("local", force=True)
     creds = await store.load_credentials("local")
     saved = json.loads(cred_file.read_text(encoding="utf-8"))
-    check("响应缺少 refresh_token 时沿用旧值", got == "acc-next" and creds.get("refresh_token") == "ref-old", str(creds.get("refresh_token")))
+    check("响应缺少 refresh_token 时沿用旧值", got == "acc-next" and creds.get("refresh_token") == "ref-old")
     check("回写保留未轮换的 refresh_token", saved["refresh_token"] == "ref-old")
 
 
@@ -233,9 +233,9 @@ async def scenario_lock_blocks(tmp: Path) -> None:
     try:
         try:
             await client.ensure_fresh("local", force=True)
-            check("拿不到刷新锁时不发 refresh", False, "未抛 OAuthError")
+            check("拿不到刷新锁时不发 refresh", False)
         except OAuthError as exc:
-            check("拿不到刷新锁时不发 refresh", "刷新锁" in str(exc), str(exc))
+            check("拿不到刷新锁时不发 refresh", "刷新锁" in str(exc))
     finally:
         local_credentials.CredentialRefreshLock.acquire = original  # type: ignore[method-assign]
 
@@ -275,7 +275,7 @@ def channel_scenarios() -> None:
         extract_text(err)
         check("错误通道优先 assistant", False)
     except DatasourceError as exc:
-        check("错误通道优先 assistant", "EMPTY_DATA" in str(exc), str(exc))
+        check("错误通道优先 assistant", "EMPTY_DATA" in str(exc))
     check(
         "空白 assistant 视为缺失",
         extract_text({
@@ -302,11 +302,11 @@ def header_scenarios(tmp: Path) -> None:
                 os.environ.pop(key)
 
         oauth_headers = identity.oauth_device_headers("dev-1", KIMI_CODE_CLI_VERSION)
-        check("OAuth 请求带产品 UA", oauth_headers.get("User-Agent") == f"kimi-code-cli/{KIMI_CODE_CLI_VERSION}", str(oauth_headers.get("User-Agent")))
-        check("OAuth 版本位跟随 CLI", oauth_headers.get("X-Msh-Version") == KIMI_CODE_CLI_VERSION, str(oauth_headers.get("X-Msh-Version")))
+        check("OAuth 请求带产品 UA", oauth_headers.get("User-Agent") == f"kimi-code-cli/{KIMI_CODE_CLI_VERSION}")
+        check("OAuth 版本位跟随 CLI", oauth_headers.get("X-Msh-Version") == KIMI_CODE_CLI_VERSION)
 
         ds_headers = identity.datasource_headers("tok", "dev-1", KIMI_DATASOURCE_VERSION, tool_call_id="tc")
-        check("datasource UA 保持插件版本位", ds_headers.get("User-Agent") == f"kimi-datasource/{KIMI_DATASOURCE_VERSION}", str(ds_headers.get("User-Agent")))
+        check("datasource UA 保持插件版本位", ds_headers.get("User-Agent") == f"kimi-datasource/{KIMI_DATASOURCE_VERSION}")
         check("datasource 默认设备头齐全", all(k in ds_headers for k in ("X-Msh-Device-Name", "X-Msh-Device-Model", "X-Msh-Os-Version", "X-Msh-Device-Id")))
 
         os.environ["KIMI_MSH_DEVICE_NAME"] = "env-name"
@@ -316,14 +316,14 @@ def header_scenarios(tmp: Path) -> None:
         check("datasource 设备头支持 env 覆盖", (ds_env["X-Msh-Device-Name"], ds_env["X-Msh-Device-Model"], ds_env["X-Msh-Os-Version"]) == ("env-name", "env-model", "env-os"))
         ms_env = identity.moonshot_headers("tok", "dev-1")
         check("search/fetch 设备头支持 env 覆盖", (ms_env["X-Msh-Device-Name"], ms_env["X-Msh-Device-Model"], ms_env["X-Msh-Os-Version"]) == ("env-name", "env-model", "env-os"))
-        check("search/fetch UA 用 CLI 版本位", ms_env.get("User-Agent") == f"kimi-code-cli/{KIMI_CODE_CLI_VERSION}", str(ms_env.get("User-Agent")))
+        check("search/fetch UA 用 CLI 版本位", ms_env.get("User-Agent") == f"kimi-code-cli/{KIMI_CODE_CLI_VERSION}")
         del os.environ["KIMI_MSH_DEVICE_NAME"], os.environ["KIMI_MSH_DEVICE_MODEL"], os.environ["KIMI_MSH_OS_VERSION"]
 
         lock = local_credentials.CredentialRefreshLock(tmp / "credentials" / "kimi-code.json")
         default_enabled = lock.enabled
         os.environ["KIMI_DISABLE_OAUTH_LOCK"] = "1"
         disabled = local_credentials.CredentialRefreshLock(tmp / "credentials" / "kimi-code.json").enabled
-        check("KIMI_DISABLE_OAUTH_LOCK=1 停用刷新锁", default_enabled == (os.name != "nt") and not disabled, f"default={default_enabled} disabled={disabled}")
+        check("KIMI_DISABLE_OAUTH_LOCK=1 停用刷新锁", default_enabled == (os.name != "nt") and not disabled)
     finally:
         os.environ.clear()
         os.environ.update(saved_env)
