@@ -136,7 +136,7 @@ class KimiQuotaCooldown:
             await self.owner.put_kv_data(MONTHLY_COOLDOWNS_KEY, states)
 
 
-    async def _confirm_success(self, account_id: str, generation: str) -> None:
+    async def _confirm_success(self, account_id: str, generation: str) -> bool:
         async with self._lock:
             states = await self._load()
             record = self._record(states.get(account_id))
@@ -144,6 +144,8 @@ class KimiQuotaCooldown:
             if record is not None and record.get("generation") == generation:
                 states.pop(account_id, None)
                 await self.owner.put_kv_data(MONTHLY_COOLDOWNS_KEY, states)
+                return True
+            return False
 
     @asynccontextmanager
     async def request(self, account_id: str):
@@ -164,10 +166,10 @@ class KimiQuotaCooldown:
                     ) from None
             raise
         else:
-            if generation is not None:
-                await self._confirm_success(account_id, generation)
-            if self.success_callback is not None and await self.get(account_id) is None:
-                await self.success_callback(account_id)
+            if generation is not None and await self._confirm_success(account_id, generation):
+                # 普通请求成功可能仍在消费本期余量，只有冷却复核成功才推进周期。
+                if self.success_callback is not None and await self.get(account_id) is None:
+                    await self.success_callback(account_id)
         finally:
             if generation is not None:
                 self._inflight.discard(account_id)

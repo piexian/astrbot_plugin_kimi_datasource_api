@@ -98,6 +98,38 @@ async def test_confirmed_monthly_error_waits_for_bound_date_even_with_weekly_quo
 
 
 @pytest.mark.asyncio
+async def test_regular_success_on_bound_day_does_not_assume_monthly_reset(tmp_path):
+    store, _, _, _ = await migrated(tmp_path)
+    now = datetime(2026, 9, 22, 1, tzinfo=timezone.utc)
+    store.cooldown.clock = lambda: now.timestamp()
+    rule = parse_monthly_reset("22", now=now)
+    await store.set_monthly_reset("test", rule)
+    async with store.cooldown.request("test"):
+        pass
+    assert (await store.get_monthly_reset("test"))["next_date"] == "2026-09-22"
+    with pytest.raises(QuotaCooldownError):
+        async with store.cooldown.request("test"):
+            raise ERROR
+    assert (await store.cooldown.get("test"))["retry_at"] == now.timestamp() + 3600
+
+
+@pytest.mark.asyncio
+async def test_forgotten_probe_cannot_advance_binding(tmp_path):
+    store, _, _, _ = await migrated(tmp_path)
+    clock = [datetime(2026, 9, 22, 1, tzinfo=timezone.utc).timestamp()]
+    store.cooldown.clock = lambda: clock[0]
+    rule = parse_monthly_reset("22", now=datetime.fromtimestamp(clock[0], timezone.utc))
+    await store.set_monthly_reset("test", rule)
+    with pytest.raises(QuotaCooldownError):
+        async with store.cooldown.request("test"):
+            raise ERROR
+    clock[0] += 3600
+    async with store.cooldown.request("test"):
+        await store.cooldown.forget(["test"])
+    assert (await store.get_monthly_reset("test"))["next_date"] == "2026-09-22"
+
+
+@pytest.mark.asyncio
 async def test_bound_reset_is_not_cleared_by_refresh_and_retries_hourly_after_due(tmp_path):
     store, _, _, _ = await migrated(tmp_path)
     clock = [NOW.timestamp()]
