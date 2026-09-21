@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -34,6 +35,7 @@ from .models import (
     token_from_credentials,
     token_from_oauth_payload,
 )
+from .monthly import validate_monthly_reset
 from .storage import KimiCredentialStore
 
 RETRYABLE_REFRESH_STATUSES = {429, 500, 502, 503, 504}
@@ -61,6 +63,13 @@ class KimiOAuthClient:
         self.proxy = proxy.strip() or None
         self.max_refresh_retries = max(1, max_refresh_retries)
         self._refresh_lock = asyncio.Lock()
+        self._request_device_id: ContextVar[str | None] = ContextVar("kimi_oauth_device", default=None)
+        self._closing = False
+
+    async def close(self) -> None:
+        self._closing = True
+        async with self._refresh_lock:
+            pass
 
     async def request_device_authorization(self) -> DeviceAuthorization:
         status, data = await self._post_form(
@@ -161,8 +170,33 @@ class KimiOAuthClient:
 
         raise OAuthError(str(last_error or "Token refresh failed."))
 
-    async def ensure_fresh(self, account_id: str | None = None, *, force: bool = False) -> str:
-        account_id, token = await self._load_account_token(account_id)
+    async def ensure_fresh(
+        self, account_id: str | None = None, *, force: bool = False, allow_revoked: bool = False,
+        monthly_reset: dict | None = None,
+    ) -> str:
+        task = asyncio.create_task(self._ensure_fresh(
+            account_id, force=force, allow_revoked=allow_revoked, monthly_reset=monthly_reset,
+        ))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 刷新会消耗旧 token，取消调用也要等待新凭据落盘。
+            await task
+            raise
+
+    async def _ensure_fresh(
+        self, account_id: str | None = None, *, force: bool = False, allow_revoked: bool = False,
+        monthly_reset: dict | None = None,
+    ) -> str:
+        if self._closing:
+            raise OAuthError("插件正在停止，请稍后重试。")
+        if monthly_reset is not None:
+            if not account_id or not force:
+                raise OAuthError("绑定月重置时间需指定账号并显式刷新。")
+            monthly_reset = validate_monthly_reset(monthly_reset)
+        if allow_revoked and (not account_id or not force):
+            raise OAuthError("恢复账号必须显式指定账号 ID 并强制刷新。")
+        account_id, token = await self._load_account_token(account_id, allow_revoked=allow_revoked)
         if token is None:
             credentials = await self.store.load_credentials(account_id)
             if credentials and credentials.get("status") == "revoked":
@@ -171,8 +205,10 @@ class KimiOAuthClient:
         if not self._should_refresh(token, force):
             return token.access_token
 
-        async with self._refresh_lock:
-            account_id, token = await self._load_account_token(account_id)
+        async with self._refresh_lock, self.store.account_guard(account_id):
+            if self._closing:
+                raise OAuthError("插件正在停止，请稍后重试。")
+            account_id, token = await self._load_account_token(account_id, allow_revoked=allow_revoked)
             if token is None:
                 raise OAuthUnauthorizedError(f"Kimi account {account_id} is missing or revoked; re-login required.")
             if not self._should_refresh(token, force):
@@ -181,6 +217,7 @@ class KimiOAuthClient:
                 raise OAuthError(f"Kimi account {account_id} has no refresh_token; re-login required.")
 
             credentials = await self.store.load_credentials(account_id) or {}
+            device_id = str(credentials.get("device_id") or await self.store.get_device_id())
             local_path = local_credentials_file(credentials)
             lock: CredentialRefreshLock | None = None
             if local_path is not None:
@@ -188,39 +225,54 @@ class KimiOAuthClient:
                 lock = CredentialRefreshLock(local_path)
                 if not await lock.acquire():
                     raise OAuthError(f"Kimi 凭证刷新锁被占用，账号 {account_id} 请稍后重试。")
+            device_context = self._request_device_id.set(device_id)
             try:
-                adopted = await self._adopt_local_token(account_id, local_path, token)
+                adopted = await self._adopt_local_token(
+                    account_id, local_path, token, persist=not allow_revoked
+                )
                 if adopted is not None:
                     token = adopted
-                    # 对齐官方：等待锁期间 token 已被轮换时，force 也直接返回新 token 不再刷
-                    if force or not self._should_refresh(token, force):
+                    # 显式恢复需先通过服务端刷新，不能仅凭本机副本解除 revoked。
+                    if not allow_revoked and (force or not self._should_refresh(token, force)):
+                        if monthly_reset is not None:
+                            await self.store.set_monthly_reset(account_id, monthly_reset)
                         return token.access_token
                 try:
                     refreshed = await self.refresh_access_token(token.refresh_token)
                 except OAuthUnauthorizedError:
                     recovery = await self.store.load_token(account_id)
                     if recovery and recovery.refresh_token != token.refresh_token:
+                        if monthly_reset is not None:
+                            await self.store.set_monthly_reset(account_id, monthly_reset)
                         return recovery.access_token
-                    recovery = await self._adopt_local_token(account_id, local_path, token)
-                    if recovery is not None and recovery.expires_at > now_seconds():
+                    recovery = await self._adopt_local_token(
+                        account_id, local_path, token, persist=not allow_revoked
+                    )
+                    if not allow_revoked and recovery is not None and recovery.expires_at > now_seconds():
+                        if monthly_reset is not None:
+                            await self.store.set_monthly_reset(account_id, monthly_reset)
                         return recovery.access_token
                     await self.store.mark_revoked(account_id)
                     raise
-                device_id = await self.store.get_device_id()
-                await self.store.save_refreshed_token(account_id, refreshed, device_id=device_id)
-                if local_path is not None and local_refresh_token(local_path) == token.refresh_token:
-                    # 文件仍持有我们刚消费掉的 refresh_token：回写新凭证，否则同机 CLI 登录态失效
-                    if not write_local_tokens(local_path, refreshed):
-                        logger.warning(
-                            f"[{PLUGIN_NAME}] 回写本机凭证 {local_path} 失败，同机 kimi-code CLI 登录态可能失效"
-                        )
+                try:
+                    await self.store.save_refreshed_token(
+                        account_id, refreshed, device_id=device_id, monthly_reset=monthly_reset
+                    )
+                finally:
+                    # 即使受管文件暂时不可写，也尽力保全已轮换的 CLI 凭据。
+                    if local_path is not None and local_refresh_token(local_path) == token.refresh_token:
+                        if not write_local_tokens(local_path, refreshed):
+                            logger.warning(
+                                f"[{PLUGIN_NAME}] 回写本机凭证 {local_path} 失败，同机 kimi-code CLI 登录态可能失效"
+                            )
                 return refreshed.access_token
             finally:
+                self._request_device_id.reset(device_context)
                 if lock is not None:
                     await lock.release()
 
     async def _adopt_local_token(
-        self, account_id: str, local_path: Path | None, token: TokenInfo
+        self, account_id: str, local_path: Path | None, token: TokenInfo, *, persist: bool = True
     ) -> TokenInfo | None:
         """本机 CLI 已轮换过凭证时采纳它，避免用掉被吊销的 refresh_token。"""
         if local_path is None:
@@ -228,11 +280,14 @@ class KimiOAuthClient:
         local_token = parse_local_tokens(local_path)
         if local_token is None or local_token.refresh_token == token.refresh_token:
             return None
-        device_id = await self.store.get_device_id()
-        await self.store.save_refreshed_token(account_id, local_token, device_id=device_id)
+        if persist:
+            device_id = await self.store.get_device_id(account_id)
+            await self.store.save_refreshed_token(account_id, local_token, device_id=device_id)
         return local_token
 
-    async def _load_account_token(self, account_id: str | None) -> tuple[str, TokenInfo | None]:
+    async def _load_account_token(
+        self, account_id: str | None, *, allow_revoked: bool = False
+    ) -> tuple[str, TokenInfo | None]:
         credentials = await self.store.load_credentials(account_id)
         if not credentials:
             if account_id:
@@ -240,6 +295,8 @@ class KimiOAuthClient:
             ids = await self.store.list_account_ids(include_revoked=False)
             return (ids[0] if ids else "default"), None
         selected_id = str(credentials.get("account_id") or account_id or "")
+        if allow_revoked:
+            credentials = {**credentials, "status": "valid"}
         return selected_id, token_from_credentials(credentials)
 
     def _should_refresh(self, token: TokenInfo, force: bool) -> bool:
@@ -251,7 +308,7 @@ class KimiOAuthClient:
         return token.expires_at - now_seconds() < threshold
 
     async def _post_form(self, path: str, params: dict[str, str]) -> tuple[int, dict[str, Any]]:
-        device_id = await self.store.get_device_id()
+        device_id = self._request_device_id.get() or await self.store.get_device_id()
         headers = {
             **oauth_device_headers(device_id, self.version),
             "Content-Type": "application/x-www-form-urlencoded",

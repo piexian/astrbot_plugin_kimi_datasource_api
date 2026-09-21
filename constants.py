@@ -1,6 +1,6 @@
 PLUGIN_NAME = "astrbot_plugin_kimi_datasource_api"
 PLUGIN_DISPLAY_NAME = "Kimi Datasource API"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.3.1"
 
 # 对齐官方 kimi-datasource 插件版本号，用于 X-Msh-Version / User-Agent 请求头
 KIMI_DATASOURCE_VERSION = "3.4.0"

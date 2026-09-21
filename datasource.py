@@ -16,8 +16,9 @@ from .constants import (
     KIMI_DATASOURCE_VERSION,
     VALID_STOCK_QUERY_TYPES,
 )
+from .credential_files import CredentialFileError
 from .identity import datasource_headers
-from .models import DatasourceError, DatasourceHTTPError, OAuthUnauthorizedError, ToolInputError
+from .models import DatasourceError, DatasourceHTTPError, OAuthUnauthorizedError, QuotaCooldownError, ToolInputError
 from .oauth import KimiOAuthClient
 from .storage import KimiCredentialStore
 
@@ -91,37 +92,52 @@ class KimiDatasourceClient:
         tool_call_id = str(uuid4())
         request_id = ""
         errors: list[str] = []
+        has_cooldown = False
+        has_file_error = False
+        permission_error: DatasourceHTTPError | None = None
         for account_id in account_rotation(account_ids, start_id):
             try:
-                response, request_id = await self._post_json(
-                    method, params, account_id=account_id, force_refresh=False, tool_call_id=tool_call_id
-                )
+                async with self.store.cooldown.request(account_id):
+                    for force in (False, True):
+                        try:
+                            response, request_id = await self._post_json(
+                                method, params, account_id=account_id, force_refresh=force, tool_call_id=tool_call_id
+                            )
+                            break
+                        except DatasourceHTTPError as exc:
+                            if exc.status != 401:
+                                raise
+                            if force:
+                                await self.store.mark_revoked(account_id)
+                                raise OAuthUnauthorizedError(str(exc)) from None
+                    text = extract_text(response, mode=self.response_parse_mode)
                 break
+            except QuotaCooldownError as exc:
+                has_cooldown = True
+                errors.append(str(exc))
+            except DatasourceHTTPError as exc:
+                if exc.status != 403:
+                    raise
+                permission_error = exc
+                errors.append(f"{account_id}: {exc}")
+            except CredentialFileError as exc:
+                has_file_error = True
+                errors.append(f"{account_id}: {exc}")
             except OAuthUnauthorizedError as exc:
                 errors.append(f"{account_id}: {exc}")
-                continue
-            except DatasourceHTTPError as exc:
-                if exc.status not in {401, 403}:
-                    raise
-                try:
-                    response, request_id = await self._post_json(
-                        method, params, account_id=account_id, force_refresh=True, tool_call_id=tool_call_id
-                    )
-                    break
-                except DatasourceHTTPError as retry_exc:
-                    if retry_exc.status in {401, 403}:
-                        await self.store.mark_revoked(account_id)
-                        errors.append(f"{account_id}: datasource authorization failed")
-                        continue
-                    raise
-                except OAuthUnauthorizedError as retry_exc:
-                    errors.append(f"{account_id}: {retry_exc}")
-                    continue
         else:
             message = "; ".join(errors) if errors else "all accounts failed"
+            if has_cooldown:
+                raise QuotaCooldownError(f"Kimi 当前无可用账号：{message}")
+            if permission_error is not None:
+                raise DatasourceHTTPError(403, json.dumps({"error": {
+                    "type": permission_error.error_type, "message": f"Kimi 当前无可用账号：{message}",
+                }}))
+            if has_file_error:
+                raise CredentialFileError(f"Kimi 当前无可用凭据文件：{message}")
             raise OAuthUnauthorizedError(f"Kimi datasource authorization failed for every configured account: {message}")
         text = append_trace(
-            extract_text(response, mode=self.response_parse_mode),
+            text,
             request_id=request_id,
             tool_call_id=tool_call_id,
         )
@@ -132,7 +148,7 @@ class KimiDatasourceClient:
         self, method: str, params: dict[str, Any], *, account_id: str, force_refresh: bool, tool_call_id: str = ""
     ) -> tuple[Any, str]:
         token = await self.oauth.ensure_fresh(account_id, force=force_refresh)
-        device_id = await self.store.get_device_id()
+        device_id = await self.store.get_device_id(account_id)
         timeout = aiohttp.ClientTimeout(total=max(1, self.timeout_seconds))
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
@@ -144,7 +160,7 @@ class KimiDatasourceClient:
                 ) as response:
                     body = await response.text()
                     if not response.ok:
-                        raise DatasourceHTTPError(response.status, body)
+                        raise DatasourceHTTPError(response.status, body, secrets=(token,))
                     try:
                         return json.loads(body), extract_request_id(response.headers)
                     except json.JSONDecodeError:
