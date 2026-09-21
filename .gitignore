@@ -191,8 +191,18 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
-# Local verification tests
-tests/
+# Keep live credential probes local; track offline regression tests.
+tests/*
+!tests/conftest.py
+!tests/test_auth_errors.py
+!tests/test_usage.py
+!tests/test_cooldown.py
+!tests/test_file_store.py
+!tests/test_monthly.py
+!tests/test_file_commands.py
+!tests/test_panel_credentials.py
+!tests/test_astrbot_load.py
+!tests/test_local_sync.py
 
 # Local AstrBot plugin data fallback
 data/

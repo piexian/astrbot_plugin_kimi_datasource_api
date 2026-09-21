@@ -17,13 +17,14 @@ from .constants import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     KIMI_CODE_CLI_VERSION,
 )
+from .credential_files import CredentialFileError
 from .datasource import account_rotation, required_string
 from .identity import moonshot_headers
-from .models import DatasourceError, DatasourceHTTPError, OAuthUnauthorizedError, ToolInputError
+from .models import DatasourceError, DatasourceHTTPError, OAuthUnauthorizedError, QuotaCooldownError, ToolInputError
 from .oauth import KimiOAuthClient
 from .storage import KimiCredentialStore
 
-AUTH_STATUS_CODES = {401, 403}
+AUTH_STATUS_CODES = {401}
 MAX_LOCAL_FETCH_BYTES = 10 * 1024 * 1024
 MAX_LOCAL_REDIRECTS = 5
 
@@ -75,7 +76,8 @@ class KimiMoonshotClient:
                 expect_json=False,
             )
         except DatasourceHTTPError as exc:
-            if exc.status in AUTH_STATUS_CODES:
+            # 权限或额度拒绝仍直接报告，不借本地抓取掩盖服务限制。
+            if exc.status in {401, 403}:
                 raise
             return await self._local_fetch_after_remote_error(url, exc)
         except DatasourceError as exc:
@@ -100,42 +102,39 @@ class KimiMoonshotClient:
 
         start_id = await self.store.next_account_id(account_ids)
         errors: list[str] = []
+        has_cooldown = False
+        has_file_error = False
         for account_id in account_rotation(account_ids, start_id):
             try:
-                return await self._post(
-                    endpoint,
-                    payload,
-                    account_id=account_id,
-                    force_refresh=False,
-                    accept=accept,
-                    expect_json=expect_json,
-                )
+                async with self.store.cooldown.request(account_id):
+                    for force in (False, True):
+                        try:
+                            response = await self._post(
+                                endpoint, payload, account_id=account_id, force_refresh=force,
+                                accept=accept, expect_json=expect_json,
+                            )
+                            break
+                        except DatasourceHTTPError as exc:
+                            if exc.status not in AUTH_STATUS_CODES:
+                                raise
+                            if force:
+                                await self.store.mark_revoked(account_id)
+                                raise OAuthUnauthorizedError(str(exc)) from None
+                return response
+            except QuotaCooldownError as exc:
+                has_cooldown = True
+                errors.append(str(exc))
+            except CredentialFileError as exc:
+                has_file_error = True
+                errors.append(f"{account_id}: {exc}")
             except OAuthUnauthorizedError as exc:
                 errors.append(f"{account_id}: {exc}")
-                continue
-            except DatasourceHTTPError as exc:
-                if exc.status not in AUTH_STATUS_CODES:
-                    raise
-                try:
-                    return await self._post(
-                        endpoint,
-                        payload,
-                        account_id=account_id,
-                        force_refresh=True,
-                        accept=accept,
-                        expect_json=expect_json,
-                    )
-                except DatasourceHTTPError as retry_exc:
-                    if retry_exc.status in AUTH_STATUS_CODES:
-                        await self.store.mark_revoked(account_id)
-                        errors.append(f"{account_id}: moonshot authorization failed")
-                        continue
-                    raise
-                except OAuthUnauthorizedError as retry_exc:
-                    errors.append(f"{account_id}: {retry_exc}")
-                    continue
 
         message = "; ".join(errors) if errors else "all accounts failed"
+        if has_cooldown:
+            raise QuotaCooldownError(f"Kimi 当前无可用账号：{message}")
+        if has_file_error:
+            raise CredentialFileError(f"Kimi 当前无可用凭据文件：{message}")
         raise OAuthUnauthorizedError(f"Kimi Moonshot authorization failed for every configured account: {message}")
 
     async def _post(
@@ -149,7 +148,7 @@ class KimiMoonshotClient:
         expect_json: bool,
     ) -> Any:
         token = await self.oauth.ensure_fresh(account_id, force=force_refresh)
-        device_id = await self.store.get_device_id()
+        device_id = await self.store.get_device_id(account_id)
         timeout = aiohttp.ClientTimeout(total=max(1, self.timeout_seconds))
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
@@ -161,7 +160,7 @@ class KimiMoonshotClient:
                 ) as response:
                     body = await response.text()
                     if not response.ok:
-                        raise DatasourceHTTPError(response.status, body)
+                        raise DatasourceHTTPError(response.status, body, secrets=(token,))
                     if not expect_json:
                         return body
                     try:

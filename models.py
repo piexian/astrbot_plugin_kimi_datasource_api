@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -28,11 +30,62 @@ class DatasourceAuthError(DatasourceError):
     pass
 
 
+def safe_error_text(value: str, *, secrets: tuple[str, ...] = ()) -> str:
+    """限制错误长度并移除凭据，避免上游回显进入聊天或日志。"""
+    for secret in secrets:
+        if secret:
+            value = value.replace(secret, "[REDACTED]")
+    value = re.sub(r"\beyJ[A-Za-z0-9_.-]+", "[REDACTED]", value)
+    value = re.sub(r"(?i)\bBearer\s+[^\s\"'<>]+", "Bearer [REDACTED]", value)
+    value = re.sub(
+        r"(?i)((?:access_token|refresh_token|device_code|user_code|api_key)[\\\"']*\s*[:=]\s*[\\\"']*)[^\\\s,\"'&}]+",
+        r"\1[REDACTED]",
+        value,
+    )
+    value = " ".join(value.split())
+    return value[:600] + ("…" if len(value) > 600 else "")
+
+
+def api_error_fields(body: str) -> tuple[str, str]:
+    """提取官方错误类型与说明，兼容非 JSON 网关错误。"""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return "", body or "empty response"
+    if not isinstance(payload, dict):
+        return "", body or "empty response"
+    error = payload.get("error")
+    source = error if isinstance(error, dict) else payload
+    error_type = source.get("type") or source.get("code")
+    detail = next(
+        (source[key] for key in ("message", "error_description", "detail")
+         if isinstance(source.get(key), str) and source[key].strip()),
+        error if isinstance(error, str) else "request failed",
+    )
+    return error_type if isinstance(error_type, str) else "", detail
+
+
 class DatasourceHTTPError(DatasourceError):
-    def __init__(self, status: int, body: str) -> None:
+    def __init__(self, status: int, body: str, *, secrets: tuple[str, ...] = ()) -> None:
         self.status = status
-        self.body = body
-        super().__init__(f"HTTP {status} error: {body}")
+        self.body = safe_error_text(body, secrets=secrets)
+        error_type, detail = api_error_fields(body)
+        self.error_type = safe_error_text(error_type, secrets=secrets)[:80]
+        self.detail = safe_error_text(detail, secrets=secrets)
+        label = f" ({self.error_type})" if self.error_type else ""
+        self.is_monthly_quota = (
+            status == 403
+            and self.error_type == "access_terminated_error"
+            and "monthly usage limit" in detail.lower()
+        )
+        hint = ""
+        if self.is_monthly_quota:
+            hint = "本计费周期月度额度已用尽，重新登录无法恢复额度。"
+        super().__init__(f"HTTP {status}{label}: {hint}{self.detail}")
+
+
+class QuotaCooldownError(KimiPluginError):
+    """账号月度额度冷却，不属于登录失效或抓取降级。"""
 
 
 class ToolInputError(DatasourceError):

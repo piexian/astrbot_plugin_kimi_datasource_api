@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -27,6 +26,9 @@ from .constants import (
     PLUGIN_NAME,
 )
 from .datasource import KimiDatasourceClient
+from .cooldown import DEFAULT_COOLDOWN_MINUTES
+from .credential_files import AsyncRLock, CredentialFileError, env_credential_filename, file_io, token_claims
+from .monthly import describe_monthly_reset, parse_monthly_reset, split_account_reset_args
 from .models import KimiPluginError, OAuthUnauthorizedError, token_from_credentials
 from .moonshot import KimiMoonshotClient
 from .oauth import KimiOAuthClient
@@ -37,9 +39,11 @@ from .schemas import (
     MOONSHOT_SEARCH_SCHEMA,
     QUERY_STOCK_SCHEMA,
 )
-from .sessions import PendingLogin, PendingLoginRegistry
+from .sessions import PendingLogin, PendingLoginRegistry, stop_controller
 from .storage import KimiCredentialStore, mask_token, normalize_account_id, normalize_account_id_list
+from .panel_credentials import KimiPanelCredentialStore
 from .tool_defs import KimiFunctionTool
+from .usage import KimiUsageClient, format_usage
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -58,6 +62,9 @@ CONFIG_PATHS = {
     "response_parse_mode": ("datasource_settings", "response_parse_mode"),
     "save_response_files": ("datasource_settings", "save_response_files"),
     "account_ids": ("account_settings", "account_ids"),
+    "account_files": ("account_settings", "account_files"),
+    "credential_imports": ("account_settings", "credential_imports"),
+    "monthly_cooldown_minutes": ("account_settings", "monthly_cooldown_minutes"),
 }
 
 CONFIG_DEFAULTS = {
@@ -69,7 +76,21 @@ CONFIG_DEFAULTS = {
     "response_parse_mode": "official",
     "save_response_files": True,
     "account_ids": [],
+    "account_files": [],
+    "credential_imports": [],
+    "monthly_cooldown_minutes": DEFAULT_COOLDOWN_MINUTES,
 }
+
+
+class LoginSessionFilter(DefaultSessionFilter):
+    def __init__(self):
+        self.nonce = os.urandom(8).hex()
+
+    def key(self, origin: str, sender: str) -> str:
+        return "kimi-login:" + json.dumps([self.nonce, origin, sender], ensure_ascii=False)
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        return self.key(event.unified_msg_origin, str(event.get_sender_id()))
 
 
 def local_kimi_code_roots(env: Mapping[str, str] | None = None) -> list[Path]:
@@ -125,25 +146,25 @@ def local_kimi_code_roots(env: Mapping[str, str] | None = None) -> list[Path]:
     return roots
 
 
-def env_credential_filename(oauth_host: str, base_url: str) -> str:
-    # 与 kimi-code managed-kimi-code.ts 的 env 隔离凭证命名一致
-    payload = json.dumps(
-        {"oauthHost": oauth_host.strip().rstrip("/"), "baseUrl": base_url.strip().rstrip("/")},
-        separators=(",", ":"),
-    )
-    return f"kimi-code-env-{hashlib.sha256(payload.encode()).hexdigest()[:16]}.json"
-
 
 class KimiDatasourcePlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
-        self.store = KimiCredentialStore(self)
+        self._terminating = False
+        self.store = KimiPanelCredentialStore(
+            self, cooldown_minutes=int(self._cfg("monthly_cooldown_minutes", DEFAULT_COOLDOWN_MINUTES)),
+            credential_root=self._plugin_data_dir(),
+            environment=self._credential_environment(),
+        )
+        self._file_sync_lock = AsyncRLock()
+        self._file_sync_errors: dict[str, str] = {}
         self._env_import_note: str | None = None
         self.pending_logins = PendingLoginRegistry()
         self.oauth = self._build_oauth_client()
         self.datasource = self._build_datasource_client()
         self.moonshot = self._build_moonshot_client()
+        self.usage = self._build_usage_client()
 
     async def initialize(self) -> None:
         await self._sync_config_accounts()
@@ -227,6 +248,17 @@ class KimiDatasourcePlugin(Star):
             proxy=str(self._cfg("proxy", "") or ""),
         )
 
+    def _build_usage_client(self) -> KimiUsageClient:
+        api_url = str(self._cfg("api_url", DEFAULT_DATASOURCE_API_URL) or DEFAULT_DATASOURCE_API_URL).rstrip("/")
+        base_url = api_url[: -len("/tools")] if api_url.endswith("/tools") else DEFAULT_KIMI_CODE_BASE_URL
+        return KimiUsageClient(
+            self.store,
+            self.oauth,
+            base_url=base_url,
+            timeout_seconds=int(self._cfg("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)),
+            proxy=str(self._cfg("proxy", "") or ""),
+        )
+
     def _plugin_data_dir(self) -> Path:
         if get_astrbot_plugin_data_path is not None:
             root = Path(get_astrbot_plugin_data_path())
@@ -253,7 +285,8 @@ class KimiDatasourcePlugin(Star):
         await self._sync_config_accounts()
         session_id = event.unified_msg_origin
         restart = "--restart" in event.get_message_str()
-        requested_id = normalize_account_id(self._command_args(event, "login").replace("--restart", "").strip())
+        requested, reset_text = split_account_reset_args(self._command_args(event, "login").replace("--restart", ""))
+        requested_id = normalize_account_id(requested)
         existing = self.pending_logins.get(session_id)
         if existing and not restart:
             yield event.plain_result(self._pending_text(existing))
@@ -261,10 +294,18 @@ class KimiDatasourcePlugin(Star):
         if existing:
             await self._cancel_pending(existing, notify=False)
 
+        final_account_id = ""
         try:
-            final_account_id = await self.store.allocate_account_id(requested_id)
+            monthly_reset = parse_monthly_reset(reset_text)
+            final_account_id = await self.store.allocate_account_id(requested_id, reserve=True)
             auth = await self.oauth.request_device_authorization()
+            if self._terminating:
+                raise KimiPluginError("插件正在停止，请稍后重试。")
+        except asyncio.CancelledError:
+            self.store.release_reservation(final_account_id)
+            raise
         except KimiPluginError as exc:
+            self.store.release_reservation(final_account_id)
             yield event.plain_result(f"Kimi 登录发起失败: {exc}")
             return
 
@@ -279,6 +320,9 @@ class KimiDatasourcePlugin(Star):
             started_at=now,
             deadline_at=deadline,
             interval=max(1, auth.interval),
+            initiator_id=str(event.get_sender_id()),
+            monthly_reset=monthly_reset,
+            ask_monthly_reset=not bool(reset_text),
             state="polling",
         )
         self.pending_logins.set(pending)
@@ -288,7 +332,7 @@ class KimiDatasourcePlugin(Star):
 
     @kimi.command("status")
     async def kimi_status(self, event: AstrMessageEvent):
-        """查看 Kimi datasource 登录状态。"""
+        """查看全部账号凭据状态和官方额度。"""
         await self._sync_config_accounts()
         pending = self.pending_logins.get(event.unified_msg_origin)
         if pending:
@@ -314,11 +358,18 @@ class KimiDatasourcePlugin(Star):
     async def kimi_refresh(self, event: AstrMessageEvent):
         """强制刷新一个或全部 Kimi OAuth token。"""
         await self._sync_config_accounts()
-        requested_id = normalize_account_id(self._command_args(event, "refresh"))
+        requested, reset_text = split_account_reset_args(self._command_args(event, "refresh"))
+        requested_id = normalize_account_id(requested)
         try:
+            monthly_reset = parse_monthly_reset(reset_text)
             if requested_id:
-                token = await self.oauth.ensure_fresh(requested_id, force=True)
-                yield event.plain_result(f"Kimi 账号 {requested_id} token 刷新成功: {mask_token(token)}")
+                options = {"monthly_reset": monthly_reset} if monthly_reset is not None else {}
+                await self.oauth.ensure_fresh(requested_id, force=True, allow_revoked=True, **options)
+                binding = await self.store.get_monthly_reset(requested_id)
+                yield event.plain_result(
+                    f"Kimi 账号 {requested_id} 凭证刷新成功；服务额度不会因刷新而重置。\n"
+                    f"{describe_monthly_reset(binding)}；可用 kimi status 查看。"
+                )
                 return
 
             account_ids = await self.store.list_account_ids(include_revoked=False)
@@ -346,6 +397,13 @@ class KimiDatasourcePlugin(Star):
             await self._cancel_pending(pending, notify=False)
 
         raw = self._command_args(event, "logout").strip()
+        if self.store.file_ready:
+            try:
+                message = await self._logout_file_accounts(raw)
+            except KimiPluginError as exc:
+                message = f"Kimi 账号删除失败：{exc}"
+            yield event.plain_result(message)
+            return
         if raw in {"--all", "all", "*"}:
             await self.store.delete_credentials()
             await self._write_config_account_ids([])
@@ -364,15 +422,53 @@ class KimiDatasourcePlugin(Star):
         else:
             yield event.plain_result(f"未找到 Kimi OAuth 账号: {requested_id}")
 
+    async def _logout_file_accounts(self, raw: str) -> str:
+        async with self._file_sync_lock:
+            if raw in {"--all", "all", "*"}:
+                for reserved_id in await self.pending_logins.cancel_all():
+                    self.store.release_reservation(reserved_id)
+                await self._write_config_account_files([])
+                await self.store.synchronize([], [], [], self._write_config_account_files)
+                await self.store.delete_credentials()
+                return "已删除全部 Kimi 账号及绑定凭据；CLI 来源文件保留。"
+            account_id = normalize_account_id(raw)
+            if not account_id:
+                return "请指定账号 ID，或使用 kimi logout --all。"
+            pending = self.pending_logins.for_account(account_id)
+            for login in pending:
+                await self._cancel_pending(login, notify=False)
+            relative = self.store.credential_path(account_id)
+            if not relative:
+                return f"已取消账号 {account_id} 的登录流程。" if pending else f"未找到 Kimi OAuth 账号: {account_id}"
+            remaining = []
+            for path in self._cfg("credential_imports", []):
+                if path == relative:
+                    continue
+                try:
+                    document = await file_io(self.store.files.import_document, path)
+                    if document["account_id"] == account_id:
+                        continue
+                except KimiPluginError:
+                    pass
+                remaining.append(path)
+            await self._write_config_account_files(remaining)
+            await self.store.synchronize(remaining, [], [], self._write_config_account_files)
+            await self.store.delete_account(account_id)
+            return f"已删除 Kimi OAuth 账号及凭据文件: {account_id}；CLI 来源文件保留。"
+
+
     @kimi.custom_filter(filter.PermissionTypeFilter, filter.PermissionType.ADMIN)
     @kimi.command("sync")
     async def kimi_sync(self, event: AstrMessageEvent):
-        """按配置账号 ID 列表同步删除账号。"""
+        """同步凭据文件配置并导入上传文件。"""
         removed = await self._sync_config_accounts()
-        if removed:
-            yield event.plain_result("已按配置删除账号: " + ", ".join(removed))
+        errors = {**self.store.file_errors, **getattr(self, "_file_sync_errors", {})}
+        if errors:
+            yield event.plain_result("Kimi 凭据同步存在错误：\n" + "\n".join(errors.values()))
+        elif removed:
+            yield event.plain_result("已按旧配置删除账号: " + ", ".join(removed))
         else:
-            yield event.plain_result("Kimi 账号配置已同步，没有需要删除的账号。")
+            yield event.plain_result("Kimi 凭据配置已同步。")
 
     async def _tool_query_stock(
         self,
@@ -433,6 +529,14 @@ class KimiDatasourcePlugin(Star):
             logger.error(f"[{PLUGIN_NAME}] unexpected tool error: {exc}", exc_info=True)
             return f"Kimi 工具调用失败: {exc}"
 
+    def _credential_environment(self) -> dict[str, str]:
+        api_url = str(self._cfg("api_url", DEFAULT_DATASOURCE_API_URL) or DEFAULT_DATASOURCE_API_URL).rstrip("/")
+        return {
+            "oauth_host": str(self._cfg("oauth_host", DEFAULT_OAUTH_HOST) or DEFAULT_OAUTH_HOST).strip().rstrip("/"),
+            "base_url": api_url.removesuffix("/tools"),
+        }
+
+
     async def _import_local_kimi_code(self, session_id: str, requested_id: str = "") -> str:
         credentials_path = None
         device_id_path = None
@@ -473,14 +577,13 @@ class KimiDatasourcePlugin(Star):
 
         account_id = await self.store.allocate_account_id(requested_id or "local-kimi-code")
         device_id = await self.store.get_device_id()
-        saved_id = await self.store.save_login_token(
+        saved_id = await self._save_login_credentials(
             token,
             account_id=account_id,
             device_id=device_id,
             session_id=session_id,
             local_credentials_path=str(credentials_path),
         )
-        await self._append_config_account_id(saved_id)
         return saved_id
 
     def _env_credentials_candidate(self, root: Path) -> Path | None:
@@ -525,20 +628,25 @@ class KimiDatasourcePlugin(Star):
             while self.pending_logins.is_current(pending) and pending.remaining_seconds > 0:
                 result = await self.oauth.poll_device_token(pending.device_code)
                 if result.kind == "success" and result.token:
-                    device_id = await self.store.get_device_id()
-                    account_id = await self.store.save_login_token(
-                        result.token,
-                        account_id=pending.account_id,
-                        device_id=device_id,
-                        session_id=pending.session_id,
+                    device_id = token_claims(result.token.access_token).get("device_id") or await self.store.get_device_id()
+                    account_id = await self._save_login_credentials(
+                        result.token, account_id=pending.account_id, device_id=device_id,
+                        session_id=pending.session_id, monthly_reset=pending.monthly_reset, pending=pending,
                     )
                     pending.account_id = account_id
-                    await self._append_config_account_id(account_id)
-                    await self._finish_pending(pending)
-                    await self._send_session(
-                        pending.session_id,
-                        f"Kimi 登录成功，账号 ID: {account_id}\ndatasource 工具已可使用。",
-                    )
+                    binding = await self.store.get_monthly_reset(account_id)
+                    if pending.ask_monthly_reset and binding is None and pending.initiator_id:
+                        if not await self._start_monthly_wait(pending):
+                            return
+                        message = (
+                            f"Kimi 登录成功，账号 ID: {account_id}，凭据已保存。\n"
+                            "可选填写月刷新日，例如 22、22日，或 2026-09-22 14:26:58 +08:00。\n"
+                            "只填几号则时刻未知；默认北京时间。输入 skip 跳过，超时保留登录。"
+                        )
+                    else:
+                        await self._finish_pending(pending)
+                        message = f"Kimi 登录成功，账号 ID: {account_id}，凭据已保存。\n{describe_monthly_reset(binding)}。"
+                    await self._send_session(pending.session_id, message)
                     return
                 if result.kind == "denied":
                     await self._fail_pending(pending, f"Kimi 登录被拒绝: {result.description}")
@@ -555,7 +663,23 @@ class KimiDatasourcePlugin(Star):
             raise
         except KimiPluginError as exc:
             if self.pending_logins.is_current(pending):
-                await self._fail_pending(pending, f"Kimi 登录失败: {exc}")
+                prefix = "登录凭据已保存，后续登记失败" if pending.credentials_saved else "登录失败"
+                await self._fail_pending(pending, f"Kimi {prefix}: {exc}")
+
+    async def _start_monthly_wait(self, pending: PendingLogin) -> bool:
+        stop_controller(pending.session_controller)
+        task = pending.waiter_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if not self.pending_logins.is_current(pending):
+            return False
+        pending.state = "awaiting_reset"
+        pending.deadline_at = time.time() + 120
+        pending.session_controller = None
+        pending.waiter_task = asyncio.create_task(self._wait_login_messages(pending))
+        return True
+
 
     async def _renew_device_code(self, pending: PendingLogin) -> None:
         auth = await self.oauth.request_device_authorization()
@@ -566,12 +690,29 @@ class KimiDatasourcePlugin(Star):
         await self._send_session(pending.session_id, self._auth_text(pending, is_refresh=True))
 
     async def _wait_login_messages(self, pending: PendingLogin) -> None:
-        session_filter = DefaultSessionFilter()
+        session_filter = LoginSessionFilter()
         FILTERS.append(session_filter)
-        waiter = SessionWaiter(session_filter, pending.session_id, False)
+        waiter = SessionWaiter(session_filter, session_filter.key(pending.session_id, pending.initiator_id), False)
         pending.session_controller = waiter.session_controller
 
         async def handler(controller: SessionController, event: AstrMessageEvent) -> None:
+            if not self.pending_logins.is_current(pending) or str(event.get_sender_id()) != pending.initiator_id:
+                return
+            if pending.state == "awaiting_reset":
+                text = event.get_message_str().strip()
+                if text.lower() in {"cancel", "stop", "/cancel", "取消"}:
+                    text = "skip"
+                try:
+                    rule = parse_monthly_reset(text)
+                    if rule is not None:
+                        await self.store.set_monthly_reset(pending.account_id, rule)
+                    await self._finish_pending(pending)
+                    message = describe_monthly_reset(rule) if rule is not None else "已跳过月度绑定，登录凭据已保留。"
+                    await event.send(MessageChain().message(message))
+                except KimiPluginError as exc:
+                    await event.send(MessageChain().message(str(exc)))
+                    controller.keep(max(1, pending.remaining_seconds), reset_timeout=True)
+                return
             text = event.get_message_str().strip().lower()
             if text in {"取消", "cancel", "stop", "/cancel"}:
                 await self._cancel_pending(pending, notify=True)
@@ -590,8 +731,12 @@ class KimiDatasourcePlugin(Star):
 
         try:
             await waiter.register_wait(handler, timeout=max(1, pending.remaining_seconds))
-        except (TimeoutError, asyncio.CancelledError):
-            pass
+        except TimeoutError:
+            if self.pending_logins.is_current(pending) and pending.state == "awaiting_reset":
+                await self._finish_pending(pending)
+                await self._send_session(pending.session_id, "月度绑定已超时跳过，登录凭据已保留；可用 kimi refresh <账号ID> 22 补填。")
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.warning(f"[{PLUGIN_NAME}] login session waiter ended: {exc}")
 
@@ -600,26 +745,31 @@ class KimiDatasourcePlugin(Star):
         if not removed:
             return
         pending.state = "cancelled"
-        if pending.poll_task and not pending.poll_task.done():
-            pending.poll_task.cancel()
-        if pending.session_controller:
-            pending.session_controller.stop()
+        tasks = [task for task in (pending.poll_task, pending.waiter_task)
+                 if task is not None and task is not asyncio.current_task() and not task.done()]
+        for task in tasks:
+            task.cancel()
+        stop_controller(pending.session_controller)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.store.release_reservation(pending.account_id)
         if notify:
-            await self._send_session(pending.session_id, "已取消 Kimi 登录。")
+            message = "已取消月度输入，登录凭据已保留。" if pending.credentials_saved else "已取消 Kimi 登录。"
+            await self._send_session(pending.session_id, message)
 
     async def _finish_pending(self, pending: PendingLogin) -> None:
         self.pending_logins.pop(pending.session_id)
+        self.store.release_reservation(pending.account_id)
         pending.state = "saved"
-        if pending.session_controller:
-            pending.session_controller.stop()
-        if pending.waiter_task and not pending.waiter_task.done():
+        stop_controller(pending.session_controller)
+        if pending.waiter_task and pending.waiter_task is not asyncio.current_task() and not pending.waiter_task.done():
             pending.waiter_task.cancel()
 
     async def _fail_pending(self, pending: PendingLogin, message: str) -> None:
         self.pending_logins.pop(pending.session_id)
+        self.store.release_reservation(pending.account_id)
         pending.state = "failed"
-        if pending.session_controller:
-            pending.session_controller.stop()
+        stop_controller(pending.session_controller)
         if pending.waiter_task and not pending.waiter_task.done():
             pending.waiter_task.cancel()
         await self._send_session(pending.session_id, message)
@@ -631,6 +781,10 @@ class KimiDatasourcePlugin(Star):
             logger.warning(f"[{PLUGIN_NAME}] failed to send active message: {exc}")
 
     async def _sync_config_accounts(self) -> list[str]:
+        if getattr(self, "_terminating", False):
+            raise KimiPluginError("插件正在停止，请稍后重试。")
+        if self.store.files is not None:
+            return await self._sync_file_accounts()
         accounts = await self.store.list_accounts()
         actual_ids = sorted(accounts)
         config_ids = normalize_account_id_list(self._cfg("account_ids", []))
@@ -658,13 +812,65 @@ class KimiDatasourcePlugin(Star):
         await self._write_config_account_ids(config_ids)
         return removed
 
+    async def _sync_file_accounts(self) -> list[str]:
+        async with self._file_sync_lock:
+            if self._terminating:
+                raise KimiPluginError("插件正在停止，请稍后重试。")
+            await self.store.synchronize(
+                self._cfg("credential_imports", []), self._cfg("account_files", []),
+                normalize_account_id_list(self._cfg("account_ids", [])), self._write_config_account_files,
+            )
+            await self._write_account_config({"account_files": [], "account_ids": []})
+            self._file_sync_errors = {}
+            await self.store.list_accounts()
+            return []
+
+    async def _write_account_config(self, updates: dict[str, Any]) -> None:
+        async with self._file_sync_lock:
+            previous = self.config.get("account_settings", {})
+            if not isinstance(previous, dict):
+                raise CredentialFileError("账号配置结构无效。")
+            if all(previous.get(key) == value for key, value in updates.items()):
+                return
+            self.config["account_settings"] = {**previous, **updates}
+            try:
+                save = getattr(self.config, "save_config", None)
+                if callable(save):
+                    save()
+            except Exception:
+                self.config["account_settings"] = previous
+                raise CredentialFileError("账号配置保存失败，已保存的凭据文件保留，可修复后重新同步。") from None
+
+    async def _write_config_account_files(self, paths: list[str]) -> None:
+        await self._write_account_config({"credential_imports": list(dict.fromkeys(paths))})
+
+    async def _save_login_credentials(self, token, *, account_id: str, device_id: str, session_id: str,
+                                      local_credentials_path: str = "", monthly_reset: dict | None = None,
+                                      pending: PendingLogin | None = None) -> str:
+        async with self._file_sync_lock:
+            saved = await self.store.save_login_token(
+                token, account_id=account_id, device_id=device_id, session_id=session_id,
+                local_credentials_path=local_credentials_path, monthly_reset=monthly_reset,
+            )
+            if pending is not None:
+                pending.credentials_saved = True
+            await self._append_config_account_id(saved)
+            return saved
+
+
     async def _append_config_account_id(self, account_id: str) -> None:
+        if self.store.file_ready:
+            await self._write_config_account_files(self.store.panel_paths())
+            return
         ids = normalize_account_id_list(self._cfg("account_ids", []))
         if account_id not in ids:
             ids.append(account_id)
         await self._write_config_account_ids(ids)
 
     async def _write_config_account_ids(self, account_ids: list[str]) -> None:
+        if self.store.file_ready:
+            await self._write_config_account_files(self.store.panel_paths())
+            return
         ids = normalize_account_id_list(account_ids)
         section = self.config.setdefault("account_settings", {})
         if isinstance(section, dict):
@@ -687,6 +893,9 @@ class KimiDatasourcePlugin(Star):
         )
 
     def _pending_text(self, pending: PendingLogin) -> str:
+        if pending.state == "awaiting_reset":
+            return (f"账号 {pending.account_id} 已登录，等待可选月度输入。\n"
+                    f"可填 22、22日或完整日期时间；skip 跳过。剩余 {pending.remaining_seconds} 秒。")
         return (
             "Kimi 登录正在等待授权。\n"
             f"账号 ID: {pending.account_id}\n"
@@ -697,37 +906,79 @@ class KimiDatasourcePlugin(Star):
 
     async def _credential_status_text(self) -> str:
         accounts = await self.store.list_accounts()
+        diagnostics = [f"凭据文件 {path}：{message}" for path, message in self.store.file_errors.items()]
+        diagnostics.extend(f"上传导入 {path}：{message}" for path, message in getattr(self, "_file_sync_errors", {}).items())
         if not accounts:
+            if diagnostics:
+                return "Kimi 凭据不可用：\n" + "\n".join(diagnostics)
+            if self.store.file_ready and self.store.inactive_files():
+                return "当前无启用账号；可在“凭据文件”中将以下文件添加到配置并保存：\n" + "\n".join(self.store.inactive_files().values())
             return "Kimi datasource 未登录。请管理员执行 kimi login [账号ID]。"
 
-        lines = ["Kimi datasource 账号:"]
-        for account_id in sorted(accounts):
-            credentials = accounts[account_id]
-            status = str(credentials.get("status") or "unknown")
-            expires_at = credentials.get("expires_at")
-            remaining = int(expires_at - time.time()) if isinstance(expires_at, int | float) else 0
-            expires_text = "未知"
-            if isinstance(expires_at, int | float) and expires_at > 0:
-                expires_text = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S")
-            lines.append(
-                f"- {account_id}: {status}, expires={expires_text}, remaining={max(0, remaining)}s, "
-                f"access={mask_token(str(credentials.get('access_token') or ''))}, "
-                f"refresh={mask_token(str(credentials.get('refresh_token') or ''))}"
-            )
-        return "\n".join(lines)
+        semaphore = asyncio.Semaphore(3)
+
+        async def describe(account_id: str) -> str:
+            async with semaphore:
+                credentials = accounts[account_id]
+                if credentials.get("status") == "revoked":
+                    quota_lines = [f"额度未查询：请管理员执行 kimi refresh {account_id} 复核凭据；失败时再登录。"]
+                else:
+                    try:
+                        quota_lines = format_usage(await self.usage.get_usage(account_id))
+                    except KimiPluginError as exc:
+                        quota_lines = [f"额度查询失败：{exc}"]
+                # 查询可能刷新或吊销凭据，展示查询后的状态。
+                try:
+                    credentials = await self.store.load_credentials(account_id)
+                except KimiPluginError as exc:
+                    return f"- {account_id}: 凭据读取失败：{exc}"
+                if credentials is None:
+                    return f"- {account_id}: 账号已删除"
+                status = str(credentials.get("status") or "unknown")
+                expires_at = credentials.get("expires_at")
+                expires_text, remaining = "未知", 0
+                if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and expires_at > 0:
+                    try:
+                        expires_text = datetime.fromtimestamp(expires_at).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+                        remaining = max(0, int(expires_at - time.time()))
+                    except (ValueError, OverflowError, OSError):
+                        pass
+                try:
+                    cooldown = await self.store.cooldown.get(account_id)
+                except KimiPluginError as exc:
+                    return f"- {account_id}: 冷却状态读取失败：{exc}"
+                if cooldown is not None:
+                    quota_lines.insert(0, self.store.cooldown.describe(account_id, cooldown))
+                elif credentials.get("monthly_reset") is not None:
+                    quota_lines.insert(0, describe_monthly_reset(credentials["monthly_reset"]))
+                if credentials.get("_credential_file"):
+                    quota_lines.append(f"凭据文件：{credentials['_credential_file']}")
+                summary = (
+                    f"- {account_id}: 凭据={status}, expires={expires_text}, remaining={remaining}s, "
+                    f"access={mask_token(str(credentials.get('access_token') or ''))}, "
+                    f"refresh={mask_token(str(credentials.get('refresh_token') or ''))}"
+                )
+                return summary + "\n" + "\n".join(f"  {line}" for line in quota_lines)
+
+        summaries = await asyncio.gather(*(describe(account_id) for account_id in sorted(accounts)))
+        summaries.extend(diagnostics)
+        summaries.extend(f"- {account_id}: 未启用，凭据文件 {path}" for account_id, path in self.store.inactive_files().items())
+        return "Kimi datasource 账号与额度（凭据有效不代表额度可用）:\n" + "\n".join(summaries)
 
     def _help_text(self) -> str:
         return (
             "Kimi datasource 指令:\n"
             "在前面加你的 AstrBot 唤醒前缀，例如默认配置通常是 /。\n"
             "kimi help - 显示帮助\n"
-            "kimi login [账号ID] - 管理员发起 OAuth 登录；不填则自动生成 account-N\n"
+            "kimi login [账号ID] [月重置时间] - 管理员登录，默认账号名 account-N\n"
             "kimi import-local [账号ID] - 管理员导入本机 Kimi Code 已登录凭证\n"
-            "kimi status - 查看所有账号状态\n"
-            "kimi refresh [账号ID] - 管理员刷新指定账号；不填则刷新全部有效账号\n"
+            "kimi status - 查看全部账号凭据状态、额度用量与重置时间\n"
+            "kimi refresh [账号ID] [月重置时间] - 指定账号时可更新绑定；不填账号则只刷新有效账号\n"
             "kimi logout <账号ID|--all> - 管理员删除账号\n"
-            "kimi sync - 按配置文件 account_ids 列表同步删除账号\n\n"
-            "配置文件 account_settings.account_ids 会展示已登录账号 ID；从列表删除某个 ID 后，插件会同步删除对应账号。"
+            "kimi sync - 同步凭据文件配置并导入上传文件\n\n"
+            "月重置时间可填 22、22日或完整日期时间；省略保留绑定，登录询问可 skip。\n"
+            "只填几号表示具体时刻未知；有月度报错才进入冷却，到点仅允许复核。\n"
+            "凭据文件列表就是启用列表：上传或添加文件后保存即可；登录自动加入，刷新同步更新。"
         )
 
     def _command_args(self, event: AstrMessageEvent, sub_command: str) -> str:
@@ -750,4 +1001,10 @@ class KimiDatasourcePlugin(Star):
         return root == "kimi" and parts[1] == sub_command
 
     async def terminate(self) -> None:
-        await self.pending_logins.cancel_all()
+        self._terminating = True
+        account_ids = await self.pending_logins.cancel_all()
+        for account_id in account_ids:
+            self.store.release_reservation(account_id)
+        await self.oauth.close()
+        async with self._file_sync_lock:
+            await self.store.close()
